@@ -122,6 +122,7 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
 
     let mut paragraphs = vec![Paragraph::from_section_index(0)];
     {
+        let levels = bidi_levels(&job.text);
         let mut shape_buffer = fonts.take_shape_buffer();
         for (section_index, section) in job.sections.iter().enumerate() {
             let mut font = fonts.font(&section.format.font_id.family);
@@ -132,6 +133,7 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
                 &job,
                 section_index as u32,
                 section,
+                levels.as_deref(),
                 &mut paragraphs,
             );
         }
@@ -194,6 +196,7 @@ impl ShapingContext {
         advance_width_px: f32,
         face_metrics: &StyledMetrics,
         uv_rect: UvRect,
+        cluster: u32,
     ) -> Glyph {
         Glyph {
             chr,
@@ -207,6 +210,8 @@ impl ShapingContext {
             uv_rect,
             section_index: self.section_index,
             first_vertex: 0,
+            cluster,
+            rtl: false,
         }
     }
 }
@@ -219,6 +224,22 @@ struct TextRun {
 
     /// Byte range within the section text.
     byte_range: ByteRange,
+
+    /// Resolved bidi direction, when the job contains right-to-left text.
+    rtl: Option<bool>,
+}
+
+/// Unicode bidi embedding level of every byte of `text`, or `None` when no
+/// character resolves right to left.
+///
+/// Runs are split where the level changes and each is shaped in its own
+/// direction, so the shaper mirrors brackets inside right-to-left runs.
+fn bidi_levels(text: &str) -> Option<Vec<unicode_bidi::Level>> {
+    if text.is_ascii() {
+        return None;
+    }
+    let info = unicode_bidi::BidiInfo::new(text, None);
+    info.has_rtl().then_some(info.levels)
 }
 
 /// Emit shaped glyphs from a [`harfrust::GlyphBuffer`] into a [`Paragraph`].
@@ -227,6 +248,7 @@ struct TextRun {
 /// ligatures), zero-width "continuation" glyphs are emitted for the extra
 /// characters so that `glyphs.len() == char_count` — an invariant that all
 /// cursor and selection code relies on.
+#[expect(clippy::too_many_arguments)]
 fn layout_shaped_run(
     font: &mut Font<'_>,
     run: &TextRun,
@@ -235,6 +257,8 @@ fn layout_shaped_run(
     face_metrics: &StyledMetrics,
     ctx: &mut ShapingContext,
     paragraph: &mut Paragraph,
+    // Byte offset of `run_text` inside `LayoutJob::text`.
+    text_byte_offset: usize,
 ) {
     let px_scale = face_metrics.px_scale_factor;
 
@@ -244,6 +268,10 @@ fn layout_shaped_run(
 
     // Track how many glyphs we emit per cluster so we can add zero-width
     // continuation glyphs when a cluster has more chars than glyphs.
+    // Cluster ids are byte offsets. RTL shaping visits them in descending
+    // order, and a Hebrew letter plus its niqqud can be one cluster, so the
+    // logical range is the next higher cluster boundary, not one scalar.
+    let cluster_bounds = cluster_boundaries(glyph_buffer, run_text.len());
     let mut cluster_start_byte: usize = 0;
     let mut cluster_glyph_count: usize = 0;
 
@@ -284,13 +312,15 @@ fn layout_shaped_run(
         let is_new_cluster = ctx.prev_cluster.is_none_or(|pc| pc != cluster);
         if is_new_cluster {
             if ctx.prev_cluster.is_some() {
+                let range = cluster_char_range(&cluster_bounds, cluster_start_byte);
                 emit_continuation_glyphs(
                     ctx,
                     paragraph,
                     run_text,
-                    cluster_start_byte..cluster as usize,
+                    range,
                     cluster_glyph_count,
                     face_metrics,
+                    text_byte_offset,
                 );
             }
             if !ctx.is_first_glyph_in_section {
@@ -345,6 +375,7 @@ fn layout_shaped_run(
                 advance_width_px,
                 &fallback_metrics,
                 glyph_alloc.uv_rect,
+                text_byte_offset as u32 + cluster,
             )
         } else {
             let (mut glyph_alloc, physical_x) =
@@ -374,6 +405,7 @@ fn layout_shaped_run(
                 advance_width_px,
                 face_metrics,
                 glyph_alloc.uv_rect,
+                text_byte_offset as u32 + cluster,
             )
         };
         paragraph.glyphs.push(glyph);
@@ -386,11 +418,36 @@ fn layout_shaped_run(
             ctx,
             paragraph,
             run_text,
-            cluster_start_byte..run_text.len(),
+            cluster_char_range(&cluster_bounds, cluster_start_byte),
             cluster_glyph_count,
             face_metrics,
+            text_byte_offset,
         );
     }
+}
+
+/// Sorted byte offsets where each shaped cluster starts, plus the run length.
+fn cluster_boundaries(glyph_buffer: &harfrust::GlyphBuffer, text_len: usize) -> Vec<usize> {
+    let mut bounds: Vec<usize> = glyph_buffer
+        .glyph_infos()
+        .iter()
+        .map(|info| info.cluster as usize)
+        .filter(|start| *start <= text_len)
+        .collect();
+    bounds.push(text_len);
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
+}
+
+/// Logical bytes covered by the cluster that starts at `cluster`.
+fn cluster_char_range(bounds: &[usize], cluster: usize) -> Range<usize> {
+    let end = bounds
+        .iter()
+        .copied()
+        .find(|&boundary| boundary > cluster)
+        .unwrap_or(cluster);
+    cluster..end
 }
 
 /// Emit zero-width continuation glyphs when a cluster has more characters than
@@ -406,8 +463,9 @@ fn emit_continuation_glyphs(
     cluster_bytes: Range<usize>,
     cluster_glyph_count: usize,
     face_metrics: &StyledMetrics,
+    text_byte_offset: usize,
 ) {
-    let Some(cluster_text) = run_text.get(cluster_bytes) else {
+    let Some(cluster_text) = run_text.get(cluster_bytes.clone()) else {
         return;
     };
     let char_count = cluster_text.chars().count();
@@ -416,16 +474,25 @@ fn emit_continuation_glyphs(
     }
 
     let physical_x = paragraph.cursor_x_px.round() as i32;
-
-    for chr in cluster_text.chars().skip(cluster_glyph_count) {
-        paragraph
-            .glyphs
-            .push(ctx.glyph(chr, physical_x, 0.0, face_metrics, UvRect::default()));
+    let mut byte = cluster_bytes.start;
+    for (index, chr) in cluster_text.chars().enumerate() {
+        if index >= cluster_glyph_count {
+            paragraph.glyphs.push(ctx.glyph(
+                chr,
+                physical_x,
+                0.0,
+                face_metrics,
+                UvRect::default(),
+                (text_byte_offset + byte) as u32,
+            ));
+        }
+        byte += chr.len_utf8();
     }
 }
 
 // Ignores the Y coordinate.
 #[must_use]
+#[expect(clippy::too_many_arguments)]
 fn layout_section(
     font: &mut Font<'_>,
     mut shape_buffer: harfrust::UnicodeBuffer,
@@ -433,6 +500,7 @@ fn layout_section(
     job: &LayoutJob,
     section_index: u32,
     section: &LayoutSection,
+    levels: Option<&[unicode_bidi::Level]>,
     out_paragraphs: &mut Vec<Paragraph>,
 ) -> harfrust::UnicodeBuffer {
     let LayoutSection {
@@ -467,6 +535,7 @@ fn layout_section(
         prev_cluster: None,
     };
     let mut runs = Vec::new();
+    let mut segment_offset = byte_range.as_usize().start;
 
     // Process each paragraph segment (split on newlines — the shaper can't handle them).
     for (seg_idx, segment) in SplitOrWhole::new(section_text, job.break_on_newline).enumerate() {
@@ -477,10 +546,14 @@ fn layout_section(
         }
 
         if segment.is_empty() {
+            if job.break_on_newline {
+                segment_offset += 1;
+            }
             continue;
         }
 
-        segment_into_runs(font, segment, &mut runs);
+        let segment_levels = levels.and_then(|levels| levels.get(segment_offset..));
+        segment_into_runs(font, segment, segment_levels, &mut runs);
 
         let num_runs = runs.len();
         for (run_idx, run) in runs.iter().enumerate() {
@@ -501,8 +574,21 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            let glyph_buffer = shape_text(font_face, run_text, &format.coords, shape_buffer, flags);
-
+            let direction = run.rtl.map(|rtl| {
+                if rtl {
+                    harfrust::Direction::RightToLeft
+                } else {
+                    harfrust::Direction::LeftToRight
+                }
+            });
+            let glyph_buffer = shape_text(
+                font_face,
+                run_text,
+                &format.coords,
+                shape_buffer,
+                flags,
+                direction,
+            );
             layout_shaped_run(
                 font,
                 run,
@@ -511,9 +597,13 @@ fn layout_section(
                 &face_metrics,
                 &mut ctx,
                 paragraph,
+                segment_offset + run.byte_range.as_usize().start,
             );
 
             shape_buffer = glyph_buffer.clear();
+        }
+        if job.break_on_newline {
+            segment_offset += segment.len() + 1;
         }
     }
 
@@ -771,6 +861,7 @@ fn replace_last_glyph_with_overflow_character(
         .last()
         .map(|g| g.section_index)
         .unwrap_or(row.section_index_at_start);
+    let mut overflow_cluster = row.glyphs.last().map(|glyph| glyph.cluster).unwrap_or(0);
     loop {
         let section = &job.sections[section_index as usize];
         let extra_letter_spacing = section.format.extra_letter_spacing;
@@ -836,6 +927,8 @@ fn replace_last_glyph_with_overflow_character(
                 uv_rect: replacement_glyph_alloc.uv_rect,
                 section_index,
                 first_vertex: 0, // filled in later
+                cluster: overflow_cluster,
+                rtl: false,
             });
             return;
         }
@@ -843,6 +936,7 @@ fn replace_last_glyph_with_overflow_character(
         // We didn't fit - pop the last glyph and try again.
         if let Some(last_glyph) = row.glyphs.pop() {
             section_index = last_glyph.section_index;
+            overflow_cluster = last_glyph.cluster;
         } else {
             section_index = row.section_index_at_start;
         }
@@ -1367,12 +1461,19 @@ impl RowBreakCandidates {
 ///
 /// Results are appended to `out` (which is cleared first) to allow
 /// the caller to reuse the allocation across calls.
-fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
+/// `levels` holds the bidi level of each byte of `text`, when there is one.
+fn segment_into_runs(
+    font: &mut Font<'_>,
+    text: &str,
+    levels: Option<&[unicode_bidi::Level]>,
+    out: &mut Vec<TextRun>,
+) {
     use unicode_segmentation::UnicodeSegmentation as _;
 
     out.clear();
 
     for (byte_offset, grapheme_str) in text.grapheme_indices(true) {
+        let rtl = levels.map(|levels| levels.get(byte_offset).is_some_and(|level| level.is_rtl()));
         let byte_offset = ByteIndex(byte_offset);
         let byte_end = byte_offset + grapheme_str.len();
 
@@ -1381,6 +1482,7 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
 
         if let Some(last_run) = out.last_mut()
             && last_run.font_key == font_key
+            && last_run.rtl == rtl
         {
             last_run.byte_range.end = byte_end;
             continue;
@@ -1388,6 +1490,7 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
         out.push(TextRun {
             font_key,
             byte_range: byte_offset..byte_end,
+            rtl,
         });
     }
 }
@@ -1403,6 +1506,7 @@ fn shape_text(
     coords: &VariationCoords,
     mut buffer: harfrust::UnicodeBuffer,
     flags: harfrust::BufferFlags,
+    direction: Option<harfrust::Direction>,
 ) -> harfrust::GlyphBuffer {
     let font_ref = font_face.skrifa_font_ref();
     let tweak = font_face.tweak();
@@ -1429,6 +1533,9 @@ fn shape_text(
     buffer.set_flags(flags);
     buffer.push_str(text);
     buffer.guess_segment_properties();
+    if let Some(direction) = direction {
+        buffer.set_direction(direction);
+    }
 
     shaper.shape(buffer, harfrust::ShapeOptions::new())
 }
@@ -1441,6 +1548,15 @@ mod tests {
 
     use super::{super::*, *};
     use crate::text::cursor::CCursor;
+
+    #[test]
+    fn a_descending_cluster_keeps_the_marks_that_follow_its_base() {
+        // Visual order visits the later letter first. The earlier cluster still
+        // owns every mark up to the next base, not only its own scalar.
+        let bounds = [0usize, 6, 8];
+        assert_eq!(cluster_char_range(&bounds, 0), 0..6);
+        assert_eq!(cluster_char_range(&bounds, 6), 6..8);
+    }
 
     #[test]
     fn test_zero_max_width() {

@@ -1623,6 +1623,7 @@ dependencies = [
  "similar-asserts",
  "skrifa",
  "smallvec",
+ "unicode-bidi",
  "unicode-general-category",
  "unicode-segmentation",
  "vello_cpu",

@@ -924,6 +924,22 @@ pub struct Glyph {
 
     /// Which is our first vertex in [`RowVisuals::mesh`].
     pub first_vertex: u32,
+
+    /// Byte offset of this glyph's source character in [`LayoutJob::text`].
+    ///
+    /// Callers can use this to reorder bidirectional lines without guessing
+    /// which glyphs belong together. Zero-width continuation glyphs use the byte
+    /// offset of the character they stand in for.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cluster: u32,
+
+    /// Resolved right-to-left level. The caret before this glyph is its right edge.
+    ///
+    /// Layout leaves this `false`. A caller that reorders rows sets it from the
+    /// Unicode bidi algorithm, so cursor hit-testing follows visual order while
+    /// glyph indices stay logical.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rtl: bool,
 }
 
 impl Glyph {
@@ -961,16 +977,51 @@ impl Row {
     /// Closest char at the desired x coordinate in row-relative coordinates.
     /// Returns something in the range `[0, char_count_excluding_newline()]`.
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
-        for (i, glyph) in self.glyphs.iter().enumerate() {
-            if desired_x < glyph.logical_rect().center().x {
-                return CharIndex(i);
+        // Left-to-right rows keep the original center test so existing cursor
+        // positions do not move. Right-to-left rows are not monotonic in x, so
+        // the caret is the nearest leading edge instead.
+        if self.glyphs.iter().all(|glyph| !glyph.rtl) {
+            for (i, glyph) in self.glyphs.iter().enumerate() {
+                if desired_x < glyph.logical_rect().center().x {
+                    return CharIndex(i);
+                }
+            }
+            return self.char_count_excluding_newline();
+        }
+
+        let mut best = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for index in 0..=self.glyphs.len() {
+            let dist = (desired_x - self.caret_x(index)).abs();
+            if dist < best_dist - 0.001 || ((dist - best_dist).abs() <= 0.001 && index > best) {
+                best_dist = dist;
+                best = index;
             }
         }
-        self.char_count_excluding_newline()
+        CharIndex(best)
+    }
+
+    /// X of the caret before logical glyph `index`, or after the last glyph.
+    fn caret_x(&self, index: usize) -> f32 {
+        if index >= self.glyphs.len() {
+            return if self.glyphs.last().is_some_and(|glyph| glyph.rtl) {
+                self.glyphs[self.glyphs.len() - 1].pos.x
+            } else {
+                self.size.x
+            };
+        }
+        let glyph = &self.glyphs[index];
+        if glyph.rtl {
+            glyph.max_x()
+        } else {
+            glyph.pos.x
+        }
     }
 
     pub fn x_offset(&self, column: CharIndex) -> f32 {
-        if let Some(glyph) = self.glyphs.get(column.0) {
+        if self.glyphs.iter().any(|glyph| glyph.rtl) {
+            self.caret_x(column.0)
+        } else if let Some(glyph) = self.glyphs.get(column.0) {
             glyph.pos.x
         } else {
             self.size.x
@@ -1077,6 +1128,9 @@ impl Galley {
             intrinsic_size: Vec2::ZERO,
         };
 
+        // Each paragraph was laid out on its own text, so its glyph clusters
+        // start at zero. Rebase them onto the merged job's text.
+        let mut paragraph_start = 0u32;
         for (i, galley) in galleys.iter().enumerate() {
             let current_y_offset = merged_galley.rect.height();
             let is_last_galley = i + 1 == galleys.len();
@@ -1094,12 +1148,19 @@ impl Galley {
                     let is_last_row_in_galley = row_idx + 1 == galley.rows.len();
                     // Since we remove the `\n` when splitting rows, we need to add it back here
                     ends_with_newline |= !is_last_galley && is_last_row_in_galley;
+                    let mut row = Arc::clone(&placed_row.row);
+                    if paragraph_start > 0 {
+                        for glyph in &mut Arc::make_mut(&mut row).glyphs {
+                            glyph.cluster += paragraph_start;
+                        }
+                    }
                     super::PlacedRow {
                         pos: new_pos,
-                        row: Arc::clone(&placed_row.row),
+                        row,
                         ends_with_newline,
                     }
                 }));
+            paragraph_start += galley.job.text.len() as u32 + 1;
 
             merged_galley.num_vertices += galley.num_vertices;
             merged_galley.num_indices += galley.num_indices;
@@ -1320,22 +1381,83 @@ impl Galley {
 
 /// ## Cursor positions
 impl Galley {
-    #[expect(clippy::unused_self)]
     pub fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor {
+        if self.row_has_rtl(cursor) {
+            return self.cursor_visually(cursor, true);
+        }
         if cursor.index == CharIndex::ZERO {
-            Default::default()
+            CCursor::default()
         } else {
             CCursor {
                 index: cursor.index - 1,
-                prefer_next_row: true, // default to this when navigating. It is more often useful to put cursor at the beginning of a row than at the end.
+                prefer_next_row: true,
             }
         }
     }
 
     pub fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor {
+        if self.row_has_rtl(cursor) {
+            return self.cursor_visually(cursor, false);
+        }
         CCursor {
             index: (cursor.index + 1).min(self.end().index),
             prefer_next_row: true, // default to this when navigating. It is more often useful to put cursor at the beginning of a row than at the end.
+        }
+    }
+
+    fn row_has_rtl(&self, cursor: &CCursor) -> bool {
+        let layout = self.layout_from_cursor(*cursor);
+        self.rows
+            .get(layout.row)
+            .is_some_and(|row| row.glyphs.iter().any(|glyph| glyph.rtl))
+    }
+
+    /// Move one character toward the visual left or right on a right-to-left row.
+    fn cursor_visually(&self, cursor: &CCursor, left: bool) -> CCursor {
+        let layout = self.layout_from_cursor(*cursor);
+        let Some(row) = self.rows.get(layout.row) else {
+            return *cursor;
+        };
+        let current_x = row.x_offset(layout.column);
+        let mut best: Option<(usize, f32)> = None;
+        for index in 0..=row.glyphs.len() {
+            if index == layout.column.0 {
+                continue;
+            }
+            let x = row.x_offset(CharIndex(index));
+            let delta = x - current_x;
+            let closer = if left {
+                delta < -0.01 && best.is_none_or(|(_, best_x)| x > best_x)
+            } else {
+                delta > 0.01 && best.is_none_or(|(_, best_x)| x < best_x)
+            };
+            if closer {
+                best = Some((index, x));
+            }
+        }
+        if let Some((column, _)) = best {
+            return self.cursor_from_layout(LayoutCursor {
+                row: layout.row,
+                column: CharIndex(column),
+            });
+        }
+        if left {
+            if layout.row == 0 {
+                return CCursor::default();
+            }
+            let previous = layout.row - 1;
+            let column = self.rows[previous].glyphs.len();
+            self.cursor_from_layout(LayoutCursor {
+                row: previous,
+                column: CharIndex(column),
+            })
+        } else if layout.row + 1 < self.rows.len() {
+            self.cursor_from_layout(LayoutCursor {
+                row: layout.row + 1,
+                column: CharIndex::ZERO,
+            })
+        } else {
+            self.end()
         }
     }
 
