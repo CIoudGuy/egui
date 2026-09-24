@@ -226,6 +226,7 @@ struct TextRun {
     byte_range: ByteRange,
 
     /// Resolved bidi direction, when the job contains right-to-left text.
+    /// `None` shapes left to right, like `Some(false)`.
     rtl: Option<bool>,
 }
 
@@ -574,13 +575,15 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            let direction = run.rtl.map(|rtl| {
-                if rtl {
-                    harfrust::Direction::RightToLeft
-                } else {
-                    harfrust::Direction::LeftToRight
-                }
-            });
+            // A job without right-to-left levels is left to right throughout.
+            // Letting the shaper guess from the script would reverse numbers
+            // such as Arabic-Indic digits, which the bidi algorithm keeps
+            // left to right.
+            let direction = if run.rtl == Some(true) {
+                harfrust::Direction::RightToLeft
+            } else {
+                harfrust::Direction::LeftToRight
+            };
             let glyph_buffer = shape_text(
                 font_face,
                 run_text,
@@ -1506,7 +1509,7 @@ fn shape_text(
     coords: &VariationCoords,
     mut buffer: harfrust::UnicodeBuffer,
     flags: harfrust::BufferFlags,
-    direction: Option<harfrust::Direction>,
+    direction: harfrust::Direction,
 ) -> harfrust::GlyphBuffer {
     let font_ref = font_face.skrifa_font_ref();
     let tweak = font_face.tweak();
@@ -1533,9 +1536,7 @@ fn shape_text(
     buffer.set_flags(flags);
     buffer.push_str(text);
     buffer.guess_segment_properties();
-    if let Some(direction) = direction {
-        buffer.set_direction(direction);
-    }
+    buffer.set_direction(direction);
 
     shaper.shape(buffer, harfrust::ShapeOptions::new())
 }
@@ -1864,6 +1865,32 @@ mod tests {
         assert_eq!(galley.rows[0].row.glyphs.len(), 1); // "A"
         assert_eq!(galley.rows[1].row.glyphs.len(), 0); // empty line
         assert_eq!(galley.rows[2].row.glyphs.len(), 1); // "B"
+    }
+
+    #[test]
+    fn numbers_without_right_to_left_letters_shape_left_to_right() {
+        // Arabic-Indic digits belong to the Arabic script but resolve left to
+        // right (bidi class AN at an even level). Without an explicit direction
+        // the shaper guesses right to left from the script and reverses them.
+        let pixels_per_point = 1.0;
+        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        for text in ["٤٥", "١٢:٣٠", "٤٥ messages"] {
+            let job = LayoutJob::simple(
+                text.to_owned(),
+                FontId::proportional(14.0),
+                Color32::WHITE,
+                f32::INFINITY,
+            );
+            let galley = layout(&mut fonts, pixels_per_point, job.into());
+            let glyphs = &galley.rows[0].row.glyphs;
+            assert_eq!(glyphs.len(), text.chars().count(), "{text:?}");
+            for pair in glyphs.windows(2) {
+                assert!(
+                    pair[0].cluster < pair[1].cluster && pair[0].pos.x < pair[1].pos.x,
+                    "{text:?} must run left to right in logical order"
+                );
+            }
+        }
     }
 
     #[test]
