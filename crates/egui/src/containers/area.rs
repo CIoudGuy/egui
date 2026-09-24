@@ -524,6 +524,7 @@ impl Area {
                     interact_rect: state.rect().intersect(constrain_rect),
                     sense,
                     enabled,
+                    visible: !sizing_pass,
                 },
                 true,
                 Default::default(),
