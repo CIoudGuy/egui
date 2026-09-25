@@ -369,3 +369,9 @@ map_unwrap_or = "allow" # so is this one
 self_named_module_files = "allow" # Disabled waiting on https://github.com/rust-lang/rust-clippy/issues/9602
 significant_drop_tightening = "allow" # Too many false positives
 wildcard_imports = "allow" # `use crate::*` is useful to avoid merge conflicts when adding/removing imports
+
+[patch.crates-io]
+# winit 0.30.13 plus Wayland `Occluded` events for the xdg-shell suspended state and
+# `WindowExtWayland::notify_presentation_paused` (rust-windowing/winit#4709, #4710).
+# Also carries the macOS quit-as-close and Wayland file drop patches: crmne/winit apps-0.30.
+winit = { git = "https://github.com/crmne/winit", rev = "fc4f39ff0993dd235952b749dd16b856c0194e1f" }
