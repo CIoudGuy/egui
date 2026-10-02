@@ -228,6 +228,9 @@ struct TextRun {
     /// Resolved bidi direction, when the job contains right-to-left text.
     /// `None` shapes left to right, like `Some(false)`.
     rtl: Option<bool>,
+
+    /// One emoji grapheme cluster, laid out as a single emoji.
+    emoji: bool,
 }
 
 /// Unicode bidi embedding level of every byte of `text`, or `None` when no
@@ -537,6 +540,8 @@ fn layout_section(
     };
     let mut runs = Vec::new();
     let mut segment_offset = byte_range.as_usize().start;
+    // A single emoji's advance in this font, measured on the first emoji.
+    let mut emoji_advance_px: Option<Option<f32>> = None;
 
     // Process each paragraph segment (split on newlines — the shaper can't handle them).
     for (seg_idx, segment) in SplitOrWhole::new(section_text, job.break_on_newline).enumerate() {
@@ -579,7 +584,9 @@ fn layout_section(
             // Letting the shaper guess from the script would reverse numbers
             // such as Arabic-Indic digits, which the bidi algorithm keeps
             // left to right.
-            let direction = if run.rtl == Some(true) {
+            // An emoji has no direction of its own; its parts join left to
+            // right.
+            let direction = if run.rtl == Some(true) && !run.emoji {
                 harfrust::Direction::RightToLeft
             } else {
                 harfrust::Direction::LeftToRight
@@ -592,6 +599,13 @@ fn layout_section(
                 flags,
                 direction,
             );
+            let first_glyph = paragraph.glyphs.len();
+            let cluster_start_px = paragraph.cursor_x_px
+                + if ctx.is_first_glyph_in_section {
+                    0.0
+                } else {
+                    ctx.extra_letter_spacing * pixels_per_point
+                };
             layout_shaped_run(
                 font,
                 run,
@@ -602,6 +616,19 @@ fn layout_section(
                 paragraph,
                 segment_offset + run.byte_range.as_usize().start,
             );
+            if run.emoji {
+                let advance_px = *emoji_advance_px
+                    .get_or_insert_with(|| emoji_advance(font, pixels_per_point, font_size));
+                if let Some(advance_px) = advance_px {
+                    one_emoji_wide(
+                        paragraph,
+                        first_glyph,
+                        cluster_start_px,
+                        advance_px,
+                        pixels_per_point,
+                    );
+                }
+            }
 
             shape_buffer = glyph_buffer.clear();
         }
@@ -611,6 +638,75 @@ fn layout_section(
     }
 
     shape_buffer
+}
+
+/// The advance of a single emoji ([`super::emoji::REFERENCE`]) in this font
+/// at `font_size`, in physical pixels, or `None` when no face draws it.
+fn emoji_advance(font: &mut Font<'_>, pixels_per_point: f32, font_size: f32) -> Option<f32> {
+    let reference = super::emoji::REFERENCE;
+    let face_key = font.resolve_face(reference);
+    let face = font.fonts_by_id.get_mut(&face_key)?;
+    let metrics = face.styled_metrics(pixels_per_point, font_size, &Default::default());
+    // `None` when even the face that resolves it, the replacement face, lacks it.
+    let info = face.glyph_info(reference, &metrics)?;
+    let advance = info.advance_width_unscaled.0 * metrics.px_scale_factor;
+    (advance > 0.0).then_some(advance)
+}
+
+/// Makes the glyphs of one emoji cluster, from `first` to the end of the
+/// paragraph, a single emoji `advance_px` wide starting at `start_px`.
+///
+/// The cluster's first glyph takes the whole advance and draws the first
+/// glyph the font drew for it (a family's first person, a keycap's digit),
+/// centred; the rest are zero-width continuation glyphs at its end, as for
+/// a ligature. Cursors, selection and wrapping then see one emoji.
+fn one_emoji_wide(
+    paragraph: &mut Paragraph,
+    first: usize,
+    start_px: f32,
+    advance_px: f32,
+    pixels_per_point: f32,
+) {
+    let Some(glyphs) = paragraph.glyphs.get_mut(first..) else {
+        return;
+    };
+    if glyphs.is_empty() {
+        return;
+    }
+    let end_px = start_px + advance_px;
+    // Glyphs start on whole pixels, as `layout_shaped_run` places them.
+    let start_x = start_px.round() / pixels_per_point;
+    let end_x = end_px.round() / pixels_per_point;
+    let advance = advance_px / pixels_per_point;
+    let drawn = glyphs
+        .iter()
+        .find(|glyph| !glyph.uv_rect.is_nothing())
+        .map(|glyph| {
+            let mut uv_rect = glyph.uv_rect;
+            let centring = (advance - glyph.advance_width) / 2.0;
+            uv_rect.offset.x += glyph.pos.x - start_x + centring;
+            uv_rect.offset.x = (uv_rect.offset.x * pixels_per_point).round() / pixels_per_point;
+            (uv_rect, glyph.font_face_ascent, glyph.font_face_height)
+        });
+    for (index, glyph) in glyphs.iter_mut().enumerate() {
+        if index == 0 {
+            glyph.pos.x = start_x;
+            glyph.advance_width = advance;
+            match drawn {
+                Some((uv_rect, ascent, height)) => {
+                    glyph.uv_rect = uv_rect;
+                    glyph.font_face_ascent = ascent;
+                    glyph.font_face_height = height;
+                }
+                None => glyph.uv_rect = UvRect::default(),
+            }
+        } else {
+            glyph.pos.x = end_x;
+            glyph.advance_width = 0.0;
+            glyph.uv_rect = UvRect::default();
+        }
+    }
+    paragraph.cursor_x_px = end_px;
 }
 
 /// Iterator that either splits on `'\n'` or yields the whole string once.
@@ -1482,8 +1578,13 @@ fn segment_into_runs(
 
         let base_char = grapheme_str.chars().next().unwrap_or(' ');
         let font_key = font.resolve_face(base_char);
+        // Each emoji is a run of its own, so it can be given one emoji's
+        // width whatever its font makes of it.
+        let emoji = !grapheme_str.is_ascii() && super::emoji::is_emoji_cluster(grapheme_str);
 
         if let Some(last_run) = out.last_mut()
+            && !emoji
+            && !last_run.emoji
             && last_run.font_key == font_key
             && last_run.rtl == rtl
         {
@@ -1494,6 +1595,7 @@ fn segment_into_runs(
             font_key,
             byte_range: byte_offset..byte_end,
             rtl,
+            emoji,
         });
     }
 }
@@ -1915,6 +2017,71 @@ mod tests {
             "Expected >= 8 glyphs, got {}",
             galley.rows[0].row.glyphs.len()
         );
+    }
+
+    /// Lays `text` out in one row at 14 points with egui's default fonts.
+    fn one_row(text: &str, pixels_per_point: f32) -> Galley {
+        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        let job = LayoutJob::simple(
+            text.to_owned(),
+            FontId::proportional(14.0),
+            Color32::WHITE,
+            f32::INFINITY,
+        );
+        layout(&mut fonts, pixels_per_point, job.into())
+    }
+
+    #[test]
+    fn every_emoji_cluster_takes_one_emojis_width() {
+        use crate::text::cursor::CCursor;
+
+        for pixels_per_point in [1.0, 1.5, 2.0] {
+            let single = one_row("a😀b", pixels_per_point);
+            let width = single.size().x;
+            let emoji_end = single.pos_from_cursor(CCursor::new(2)).min.x;
+            let b_x = single.rows[0].row.glyphs[2].pos.x;
+            for (text, chars) in [
+                // Noto Emoji draws a family as its people and a keycap as its
+                // digit; each must still be one emoji.
+                ("a👨\u{200D}👩\u{200D}👧\u{200D}👦b", 7),
+                ("a👩🏽\u{200D}💻b", 4),
+                ("a1\u{FE0F}\u{20E3}b", 3),
+                ("a#\u{FE0F}\u{20E3}b", 3),
+                ("a🏳\u{FE0F}\u{200D}🌈b", 4),
+                ("a🇮🇹b", 2),
+                ("a👍🏽b", 2),
+                ("a\u{2122}\u{FE0F}b", 2),
+            ] {
+                let galley = one_row(text, pixels_per_point);
+                let row = &galley.rows[0].row;
+                assert_eq!(row.glyphs.len(), chars + 2, "{text:?}: one glyph per char");
+                assert!(
+                    (galley.size().x - width).abs() < 0.01,
+                    "{text:?} at {pixels_per_point}: {} wide, a single emoji {width}",
+                    galley.size().x
+                );
+                // The cursor after the cluster, and the next character, sit
+                // where they do after a single emoji.
+                let after = galley.pos_from_cursor(CCursor::new(1 + chars)).min.x;
+                assert!(
+                    (after - emoji_end).abs() < 0.01,
+                    "{text:?}: cursor at {after}"
+                );
+                assert!((row.glyphs[1 + chars].pos.x - b_x).abs() < 0.01, "{text:?}");
+                // The cluster's first glyph carries it; the rest add nothing.
+                let advancing = row.glyphs[1..=chars]
+                    .iter()
+                    .filter(|glyph| glyph.advance_width > 0.0)
+                    .count();
+                assert_eq!(advancing, 1, "{text:?}");
+                let drawn = row.glyphs[1..=chars]
+                    .iter()
+                    .filter(|glyph| !glyph.uv_rect.is_nothing())
+                    .count();
+                assert!(drawn <= 1, "{text:?}: at most one glyph drawn");
+                assert_eq!(row.glyphs[1].chr, text.chars().nth(1).unwrap());
+            }
+        }
     }
 
     #[test]

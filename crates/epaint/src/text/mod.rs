@@ -1,6 +1,7 @@
 //! Everything related to text, fonts, text layout, cursors etc.
 
 pub mod cursor;
+mod emoji;
 mod font;
 mod fonts;
 mod index;
