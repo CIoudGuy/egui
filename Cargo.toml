@@ -374,4 +374,4 @@ wildcard_imports = "allow" # `use crate::*` is useful to avoid merge conflicts w
 # winit 0.30.13 plus Wayland `Occluded` events for the xdg-shell suspended state and
 # `WindowExtWayland::notify_presentation_paused` (rust-windowing/winit#4709, #4710).
 # Also carries the macOS quit-as-close and Wayland file drop patches: crmne/winit apps-0.30.
-winit = { git = "https://github.com/crmne/winit", rev = "fb8b24c3ec3f2c499daa92aeb4e783a8efa2e973" }
+winit = { git = "https://github.com/crmne/winit", rev = "ed7caa9023f10b397f5b6ec8284a840cbd8a6f65" }
