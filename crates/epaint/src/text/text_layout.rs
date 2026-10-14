@@ -2795,6 +2795,24 @@ mod tests {
         }
     }
 
+    /// Arabic-Indic digits belong to the Arabic script, so a shaper left to guess the direction
+    /// shapes them right to left and "٤٥" comes out as "٥٤". Outside right-to-left text the bidi
+    /// algorithm keeps them left to right (<https://github.com/crmne/zapfast/issues/184>).
+    #[test]
+    fn arabic_indic_digits_without_rtl_text_stay_left_to_right() {
+        let mut fonts = test_fonts();
+        for text in ["\u{664}\u{665}", "\u{664}\u{665} messages"] {
+            let galley = layout_simple(&mut fonts, text);
+            let glyphs = &galley.rows[0].row.glyphs;
+            assert_eq!(glyphs.len(), text.chars().count(), "{text:?}");
+            assert_eq!(galley.rows[0].row.text(), text);
+            assert!(
+                glyphs[0].pos.x < glyphs[1].pos.x,
+                "{text:?}: four is drawn left of five"
+            );
+        }
+    }
+
     /// The bundled fonts have no Hebrew, so these glyphs are `.notdef`;
     /// levels, order, glyph count and cursor geometry do not depend on that.
     #[test]
