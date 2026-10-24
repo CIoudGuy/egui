@@ -1100,11 +1100,15 @@ impl GlutinWindowContext {
             4. opengl context creation
         */
         // start building config for gl display
+        let transparent_viewports = native_options.transparent_viewports;
         let config_template_builder = glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(hardware_acceleration)
             .with_depth_size(native_options.depth_buffer)
             .with_stencil_size(native_options.stencil_buffer)
-            .with_transparency(native_options.viewport.transparent.unwrap_or(false));
+            .with_transparency(template_asks_for_transparency(
+                native_options.viewport.transparent.unwrap_or(false),
+                transparent_viewports,
+            ));
         // we don't know if multi sampling option is set. so, check if its more than 0.
         let config_template_builder = if native_options.multisampling > 0 {
             config_template_builder.with_multisampling(
@@ -1139,11 +1143,19 @@ impl GlutinWindowContext {
                     event_loop,
                     config_template_builder.clone(),
                     |mut config_iterator| {
-                        let config = config_iterator.next().expect(
+                        let config = if picks_transparent_config(transparent_viewports) {
+                            first_preferred(config_iterator, |config| {
+                                config.supports_transparency() == Some(true)
+                            })
+                        } else {
+                            config_iterator.next()
+                        }
+                        .expect(
                             "failed to find a matching configuration for creating glutin config",
                         );
                         log::debug!(
-                            "using the first config from config picker closure. config: {config:?}"
+                            "using config from config picker closure (transparent viewports: {transparent_viewports}). config: {config:?}, supports transparency: {:?}",
+                            config.supports_transparency()
                         );
                         config
                     },
@@ -1758,6 +1770,37 @@ fn render_immediate_viewport(
     });
 }
 
+/// Whether the GL config template asks for transparency.
+///
+/// For [`NativeOptions::transparent_viewports`] alone it asks only on macOS, where glutin's CGL
+/// makes a single config whose transparency comes from the template. On X11 the config picker
+/// prefers a config that supports transparency instead (see [`picks_transparent_config`]), so
+/// that a display without one still gets a config: GLX and EGL leave out every config without
+/// transparency when the template asks for it.
+fn template_asks_for_transparency(root_transparent: bool, transparent_viewports: bool) -> bool {
+    root_transparent || (transparent_viewports && cfg!(target_os = "macos"))
+}
+
+/// Whether the config picker prefers a config that supports transparency.
+///
+/// Not on Windows: there WGL's transparency is the color-key transparency of overlay planes,
+/// which a see-through window does not need (see [`GlutinWindowContext::initialize_window`]).
+fn picks_transparent_config(transparent_viewports: bool) -> bool {
+    transparent_viewports && !cfg!(target_os = "windows")
+}
+
+/// The first of `items` that `prefer` accepts, else the first of `items`.
+fn first_preferred<T>(
+    mut items: impl Iterator<Item = T>,
+    prefer: impl Fn(&T) -> bool,
+) -> Option<T> {
+    let first = items.next()?;
+    if prefer(&first) {
+        return Some(first);
+    }
+    Some(items.find(|item| prefer(item)).unwrap_or(first))
+}
+
 /// The OpenGL contexts to ask for, in order of preference.
 ///
 /// 1. glutin's default, which is OpenGL 3.3 core.
@@ -1835,7 +1878,41 @@ fn save_screenshot_and_exit(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_attributes_to_try, create_first_context};
+    use super::{
+        context_attributes_to_try, create_first_context, first_preferred, picks_transparent_config,
+        template_asks_for_transparency,
+    };
+
+    #[test]
+    fn first_preferred_falls_back_to_the_first() {
+        let even = |n: &u32| n.is_multiple_of(2);
+        assert_eq!(first_preferred([1, 3, 4, 6].into_iter(), even), Some(4));
+        assert_eq!(first_preferred([2, 3].into_iter(), even), Some(2));
+        assert_eq!(
+            first_preferred([1, 3, 5].into_iter(), even),
+            Some(1),
+            "no preferred item: the first, as before"
+        );
+        assert_eq!(first_preferred(core::iter::empty(), even), None);
+    }
+
+    #[test]
+    fn transparent_viewports_change_the_config_only_where_needed() {
+        assert!(!template_asks_for_transparency(false, false));
+        assert!(template_asks_for_transparency(true, false));
+        assert!(template_asks_for_transparency(true, true));
+        assert_eq!(
+            template_asks_for_transparency(false, true),
+            cfg!(target_os = "macos"),
+            "elsewhere the picker prefers a transparent config, so that one is always found"
+        );
+        assert!(!picks_transparent_config(false));
+        assert_eq!(
+            picks_transparent_config(true),
+            !cfg!(target_os = "windows"),
+            "Windows composites a transparent window with any config that has alpha"
+        );
+    }
 
     #[test]
     fn context_attributes_end_with_compatibility_profile() {

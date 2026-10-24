@@ -323,6 +323,28 @@ pub struct NativeOptions {
     /// `egui` doesn't need the stencil buffer, so the default value is 0.
     pub stencil_buffer: u8,
 
+    /// Let viewports other than the root be see-through on X11 and macOS when they ask
+    /// for it with [`egui::ViewportBuilder::with_transparent`].
+    ///
+    /// The glow renderer draws every window with the one OpenGL config it picks for the
+    /// root window. On X11 and macOS that config supports transparency only when the root
+    /// viewport is transparent itself, so a transparent child viewport there shows its
+    /// cleared background (often black) instead of what is behind it. With this set,
+    /// eframe prefers a config that supports transparency, and falls back to the usual one
+    /// when the display has none. Where egui paints nothing, a window shows
+    /// [`crate::App::clear_color`].
+    ///
+    /// On Windows and Wayland a transparent child viewport is see-through either way, and
+    /// this changes nothing.
+    ///
+    /// The root window stays as transparent as [`Self::viewport`] says, but it shares the
+    /// config: on X11 and macOS a window that does not ask for transparency should paint
+    /// all of its pixels opaque, or what is behind it may show through there.
+    ///
+    /// Only the glow renderer uses this. The default is `false`.
+    #[cfg(feature = "glow")]
+    pub transparent_viewports: bool,
+
     /// What rendering backend to use.
     #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
     pub renderer: Renderer,
@@ -439,6 +461,9 @@ impl Default for NativeOptions {
             multisampling: 0,
             depth_buffer: 0,
             stencil_buffer: 0,
+
+            #[cfg(feature = "glow")]
+            transparent_viewports: false,
 
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             renderer: Renderer::default(),
