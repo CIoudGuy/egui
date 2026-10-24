@@ -810,6 +810,14 @@ impl GlowWinitRunning<'_> {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
+            painter.set_font_color_transfer_function(
+                integration
+                    .egui_ctx
+                    .global_style()
+                    .visuals
+                    .text_options
+                    .color_transfer_function,
+            );
             painter.paint_and_update_textures(
                 screen_size_in_pixels,
                 pixels_per_point,
@@ -1783,12 +1791,21 @@ fn render_immediate_viewport(
         [0.0, 0.0, 0.0, 0.0],
     );
 
-    painter.borrow_mut().paint_and_update_textures(
+    let mut painter = painter.borrow_mut();
+    painter.set_font_color_transfer_function(
+        egui_ctx
+            .global_style()
+            .visuals
+            .text_options
+            .color_transfer_function,
+    );
+    painter.paint_and_update_textures(
         screen_size_in_pixels,
         pixels_per_point,
         &clipped_primitives,
         &mut viewport.pending_delta,
     );
+    drop(painter);
 
     {
         profiling::scope!("swap_buffers");

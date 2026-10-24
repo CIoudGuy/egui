@@ -388,6 +388,22 @@ pub enum FontColorTransferFunction {
     /// See <https://www.desmos.com/calculator/w0ndf5blmn> for a comparison to gamma=0.5.
     #[default]
     TwoCoverageMinusCoverageSq,
+
+    /// Coverage is stored as is, and the renderer adjusts it for each text
+    /// color, as Skia's mask gamma does in Chromium: a ramp built for the
+    /// text's luminance (quantized to 3 bits), with `contrast` added toward
+    /// light backgrounds and blending corrected for a display `gamma`,
+    /// assuming the background is the text's inverse luminance. Light text
+    /// on dark gets heavier and dark text on light stays close to linear, in
+    /// one atlas for both themes.
+    ///
+    /// Chromium on Windows renders text as `{ contrast: 1.0, gamma: 2.2 }`
+    /// ([`Self::CHROMIUM_WINDOWS`]), measured against Chrome's own rendering
+    /// of the same font.
+    ///
+    /// Applied by `egui_glow`. Renderers that do not support it draw the
+    /// coverage as is, like [`Self::Off`].
+    PerColor { contrast: f32, gamma: f32 },
 }
 
 impl FontColorTransferFunction {
@@ -397,12 +413,27 @@ impl FontColorTransferFunction {
     /// A good-looking default for dark mode (white-on-black text).
     pub const DARK_MODE_DEFAULT: Self = Self::TwoCoverageMinusCoverageSq;
 
+    /// Text as Chromium renders it on Windows, in both themes.
+    pub const CHROMIUM_WINDOWS: Self = Self::PerColor {
+        contrast: 1.0,
+        gamma: 2.2,
+    };
+
+    /// The `(contrast, gamma)` a renderer applies per text color, for
+    /// [`Self::PerColor`].
+    pub fn per_color(self) -> Option<(f32, f32)> {
+        match self {
+            Self::PerColor { contrast, gamma } => Some((contrast, gamma)),
+            Self::Off | Self::Gamma(_) | Self::TwoCoverageMinusCoverageSq => None,
+        }
+    }
+
     /// How to convert a white color written by the font rasterizer
     /// into a color to be written into the font atlas.
     #[inline(always)]
     pub fn to_atlas_color(self, input_color: Color32) -> Color32 {
         match self {
-            Self::Off | Self::Gamma(1.0) => input_color,
+            Self::Off | Self::Gamma(1.0) | Self::PerColor { .. } => input_color,
 
             Self::Gamma(gamma) => {
                 let coverage = linear_f32_from_linear_u8(input_color.a());
@@ -423,7 +454,7 @@ impl FontColorTransferFunction {
     pub fn alpha_from_coverage(self, coverage: f32) -> f32 {
         let coverage = coverage.clamp(0.0, 1.0);
         match self {
-            Self::Off | Self::Gamma(1.0) => coverage,
+            Self::Off | Self::Gamma(1.0) | Self::PerColor { .. } => coverage,
             Self::Gamma(gamma) => coverage.powf(gamma),
             Self::TwoCoverageMinusCoverageSq => 2.0 * coverage - coverage * coverage,
         }
@@ -438,7 +469,7 @@ impl FontColorTransferFunction {
     /// Convert this into the closest gamma exponent
     pub fn to_gamma(self) -> f32 {
         match self {
-            Self::Off => 1.0,
+            Self::Off | Self::PerColor { .. } => 1.0,
             Self::Gamma(gamma) => gamma,
             Self::TwoCoverageMinusCoverageSq => 0.5, // approximately the same
         }

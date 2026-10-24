@@ -87,6 +87,11 @@ pub struct Painter {
     program: glow::Program,
     u_screen_size: glow::UniformLocation,
     u_sampler: glow::UniformLocation,
+    u_coverage_gamma: Option<glow::UniformLocation>,
+
+    /// `(contrast, gamma)` for the font texture's glyphs, from
+    /// [`egui::epaint::FontColorTransferFunction::PerColor`].
+    coverage_gamma: Option<(f32, f32)>,
     is_webgl_1: bool,
     vao: crate::vao::VertexArrayObject,
     srgb_textures: bool,
@@ -217,6 +222,7 @@ impl Painter {
             gl.delete_shader(frag);
             let u_screen_size = gl.get_uniform_location(program, "u_screen_size").unwrap();
             let u_sampler = gl.get_uniform_location(program, "u_sampler").unwrap();
+            let u_coverage_gamma = gl.get_uniform_location(program, "u_coverage_gamma");
 
             let vbo = gl.create_buffer()?;
 
@@ -263,6 +269,8 @@ impl Painter {
                 program,
                 u_screen_size,
                 u_sampler,
+                u_coverage_gamma,
+                coverage_gamma: None,
                 is_webgl_1,
                 vao,
                 srgb_textures,
@@ -277,6 +285,17 @@ impl Painter {
                 destroyed: false,
             })
         }
+    }
+
+    /// How glyph coverage in the font texture becomes ink: the text options'
+    /// [`egui::epaint::FontColorTransferFunction`]. Only
+    /// [`egui::epaint::FontColorTransferFunction::PerColor`] changes what the
+    /// painter draws (the others are applied to the font texture by epaint).
+    pub fn set_font_color_transfer_function(
+        &mut self,
+        transfer_function: egui::epaint::FontColorTransferFunction,
+    ) {
+        self.coverage_gamma = transfer_function.per_color();
     }
 
     /// Access the shared glow context.
@@ -529,8 +548,14 @@ impl Painter {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
         if let Some(texture) = self.texture(mesh.texture_id) {
             if *bound_texture != Some(texture) {
+                let (contrast, gamma) = self
+                    .coverage_gamma
+                    .filter(|_| mesh.texture_id == egui::TextureId::default())
+                    .unwrap_or((0.0, 0.0));
                 unsafe {
                     self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    self.gl
+                        .uniform_2_f32(self.u_coverage_gamma.as_ref(), contrast, gamma);
                 }
                 *bound_texture = Some(texture);
             }
