@@ -2050,6 +2050,8 @@ pub fn create_winit_window_attributes(
         // Windows:
         drag_and_drop: _drag_and_drop,
         taskbar: _taskbar,
+        border_shown: _border_shown,
+        rounded_corners: _rounded_corners,
 
         // wayland:
         app_id: _app_id,
@@ -2184,7 +2186,7 @@ pub fn create_winit_window_attributes(
 
     #[cfg(target_os = "windows")]
     {
-        use winit::platform::windows::WindowAttributesExtWindows as _;
+        use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows as _};
         if let Some(enable) = _drag_and_drop {
             window_attributes = window_attributes.with_drag_and_drop(enable);
         }
@@ -2193,8 +2195,22 @@ pub fn create_winit_window_attributes(
         }
 
         // don't request the undecorated-window drop shadow in fullscreen (#8399)
-        let want_undecorated_shadow = !decorations.unwrap_or(true) && !fullscreen.unwrap_or(false);
+        let want_undecorated_shadow = !decorations.unwrap_or(true)
+            && !fullscreen.unwrap_or(false)
+            && _has_shadow.unwrap_or(true);
         window_attributes = window_attributes.with_undecorated_shadow(want_undecorated_shadow);
+
+        if _border_shown == Some(false) {
+            // `None` is `DWMWA_COLOR_NONE`: no border at all.
+            window_attributes = window_attributes.with_border_color(None);
+        }
+        if let Some(rounded) = _rounded_corners {
+            window_attributes = window_attributes.with_corner_preference(if rounded {
+                CornerPreference::Round
+            } else {
+                CornerPreference::DoNotRound
+            });
+        }
     }
 
     #[cfg(target_os = "macos")]

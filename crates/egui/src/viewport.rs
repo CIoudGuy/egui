@@ -320,6 +320,8 @@ pub struct ViewportBuilder {
     // windows:
     pub drag_and_drop: Option<bool>,
     pub taskbar: Option<bool>,
+    pub border_shown: Option<bool>,
+    pub rounded_corners: Option<bool>,
 
     pub close_button: Option<bool>,
     pub minimize_button: Option<bool>,
@@ -501,11 +503,15 @@ impl ViewportBuilder {
         self
     }
 
-    /// macOS: Set to `false` to make the window render without a drop shadow.
+    /// macOS and Windows: Set to `false` to make the window render without a drop shadow.
     ///
     /// The default is `true`.
     ///
     /// Disabling this feature can solve ghosting issues experienced if using [`Self::with_transparent`].
+    ///
+    /// **Windows:** only a window made without decorations changes: it gets no shadow, and none
+    /// of the one-pixel strip along its top edge that its shadow needs.
+    /// [`ViewportCommand::Decorations`] gives a window the shadow its decorations call for.
     ///
     /// Look at winit for more details
     #[inline]
@@ -518,6 +524,28 @@ impl ViewportBuilder {
     #[inline]
     pub fn with_taskbar(mut self, show: bool) -> Self {
         self.taskbar = Some(show);
+        self
+    }
+
+    /// Windows 11: Set to `false` to leave out the thin border the system draws around the window,
+    /// also around a window without decorations.
+    ///
+    /// The default is `true`. Together with [`Self::with_rounded_corners`] and
+    /// [`Self::with_has_shadow`] set to `false`, a [transparent](Self::with_transparent) window
+    /// without decorations shows nothing but what it paints.
+    #[inline]
+    pub fn with_border_shown(mut self, shown: bool) -> Self {
+        self.border_shown = Some(shown);
+        self
+    }
+
+    /// Windows 11: Set to `false` to keep the window's corners square. The system rounds the
+    /// corners of most windows, also of a window without decorations, and clips what it paints there.
+    ///
+    /// The default is `true`.
+    #[inline]
+    pub fn with_rounded_corners(mut self, rounded: bool) -> Self {
+        self.rounded_corners = Some(rounded);
         self
     }
 
@@ -741,6 +769,8 @@ impl ViewportBuilder {
             window_level: new_window_level,
             mouse_passthrough: new_mouse_passthrough,
             taskbar: new_taskbar,
+            border_shown: new_border_shown,
+            rounded_corners: new_rounded_corners,
             window_type: new_window_type,
             override_redirect: new_override_redirect,
             monitor: new_monitor,
@@ -914,6 +944,16 @@ impl ViewportBuilder {
 
         if new_taskbar.is_some() && self.taskbar != new_taskbar {
             self.taskbar = new_taskbar;
+            recreate_window = true;
+        }
+
+        if new_border_shown.is_some() && self.border_shown != new_border_shown {
+            self.border_shown = new_border_shown;
+            recreate_window = true;
+        }
+
+        if new_rounded_corners.is_some() && self.rounded_corners != new_rounded_corners {
+            self.rounded_corners = new_rounded_corners;
             recreate_window = true;
         }
 
@@ -1308,4 +1348,44 @@ pub struct ImmediateViewport<'a> {
 
     /// The user-code that shows the GUI.
     pub viewport_ui_cb: Box<dyn FnMut(&mut Ui) + 'a>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ViewportBuilder;
+
+    #[test]
+    fn changing_the_windows_frame_recreates_the_window() {
+        let mut builder = ViewportBuilder::default().with_transparent(true);
+
+        let (commands, recreate) = builder.patch(
+            ViewportBuilder::default()
+                .with_border_shown(false)
+                .with_rounded_corners(false),
+        );
+        assert!(commands.is_empty());
+        assert!(
+            recreate,
+            "the system draws the frame when it makes the window"
+        );
+        assert_eq!(builder.border_shown, Some(false));
+        assert_eq!(builder.rounded_corners, Some(false));
+        assert_eq!(builder.transparent, Some(true));
+
+        let (_, recreate) = builder.patch(
+            ViewportBuilder::default()
+                .with_border_shown(false)
+                .with_rounded_corners(false),
+        );
+        assert!(!recreate, "the same frame again changes nothing");
+
+        let (_, recreate) = builder.patch(ViewportBuilder::default());
+        assert!(!recreate, "an unset option keeps the current one");
+        assert_eq!(builder.rounded_corners, Some(false));
+
+        let (_, recreate) = builder.patch(ViewportBuilder::default().with_rounded_corners(true));
+        assert!(recreate);
+        assert_eq!(builder.rounded_corners, Some(true));
+        assert_eq!(builder.border_shown, Some(false));
+    }
 }
