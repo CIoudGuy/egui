@@ -96,6 +96,11 @@ pub struct Painter {
 
     textures: HashMap<egui::TextureId, glow::Texture>,
 
+    /// Every mesh of a frame, uploaded together before drawing: one buffer
+    /// upload per frame instead of two per mesh. Kept to reuse their memory.
+    frame_vertices: Vec<egui::epaint::Vertex>,
+    frame_indices: Vec<u32>,
+
     next_native_tex_id: u64,
 
     /// Stores outdated OpenGL textures that are yet to be deleted
@@ -265,6 +270,8 @@ impl Painter {
                 vbo,
                 element_array_buffer,
                 textures: Default::default(),
+                frame_vertices: Vec::new(),
+                frame_indices: Vec::new(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
                 destroyed: false,
@@ -407,7 +414,13 @@ impl Painter {
         self.assert_not_destroyed();
 
         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+        self.upload_meshes(clipped_primitives);
 
+        // Where each mesh's indices start in the frame's index buffer.
+        let mut first_index = 0;
+        // The texture bound last, so that runs of meshes with one texture
+        // (text, shapes) bind it once.
+        let mut bound_texture = None;
         for egui::ClippedPrimitive {
             clip_rect,
             primitive,
@@ -417,7 +430,8 @@ impl Painter {
 
             match primitive {
                 Primitive::Mesh(mesh) => {
-                    self.paint_mesh(mesh);
+                    self.paint_mesh(mesh, first_index, &mut bound_texture);
+                    first_index += mesh.indices.len();
                 }
                 Primitive::Callback(callback) => {
                     if callback.rect.is_positive() {
@@ -452,6 +466,11 @@ impl Painter {
 
                         // Restore state:
                         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+                        // The callback may have bound other buffers and textures.
+                        unsafe {
+                            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                        }
+                        bound_texture = None;
                     }
                 }
             }
@@ -467,27 +486,53 @@ impl Painter {
         }
     }
 
+    /// Uploads the vertices and indices of every mesh in `clipped_primitives`
+    /// to the vertex and index buffers, each mesh's indices offset to where
+    /// its vertices land, so that [`Self::paint_mesh`] only draws.
+    fn upload_meshes(&mut self, clipped_primitives: &[egui::ClippedPrimitive]) {
+        profiling::function_scope!();
+        self.frame_vertices.clear();
+        self.frame_indices.clear();
+        for primitive in clipped_primitives {
+            if let Primitive::Mesh(mesh) = &primitive.primitive {
+                let base = self.frame_vertices.len() as u32;
+                self.frame_vertices.extend_from_slice(&mesh.vertices);
+                self.frame_indices
+                    .extend(mesh.indices.iter().map(|index| index + base));
+            }
+        }
+        if self.frame_indices.is_empty() {
+            return;
+        }
+        unsafe {
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.frame_vertices),
+                glow::STREAM_DRAW,
+            );
+            self.gl.buffer_data_u8_slice(
+                glow::ELEMENT_ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.frame_indices),
+                glow::STREAM_DRAW,
+            );
+        }
+    }
+
     #[inline(never)] // Easier profiling
-    fn paint_mesh(&mut self, mesh: &Mesh) {
+    fn paint_mesh(
+        &mut self,
+        mesh: &Mesh,
+        first_index: usize,
+        bound_texture: &mut Option<glow::Texture>,
+    ) {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
         if let Some(texture) = self.texture(mesh.texture_id) {
-            unsafe {
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-                self.gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.vertices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl
-                    .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.element_array_buffer));
-                self.gl.buffer_data_u8_slice(
-                    glow::ELEMENT_ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.indices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            if *bound_texture != Some(texture) {
+                unsafe {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                }
+                *bound_texture = Some(texture);
             }
 
             unsafe {
@@ -495,7 +540,7 @@ impl Painter {
                     glow::TRIANGLES,
                     mesh.indices.len() as i32,
                     glow::UNSIGNED_INT,
-                    0,
+                    (first_index * size_of::<u32>()) as i32,
                 );
             }
 
