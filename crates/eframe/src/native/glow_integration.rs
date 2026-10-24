@@ -1023,24 +1023,45 @@ impl GlowWinitRunning<'_> {
     }
 }
 
+thread_local! {
+    /// The window surface our GL context was last made current with on this
+    /// thread, `None` when unknown.
+    ///
+    /// glutin's WGL `is_current` compares only the context, which every window
+    /// shares, so on Windows it cannot tell whether a given window's surface is
+    /// current (<https://github.com/emilk/egui/issues/4289>). Every switch goes
+    /// through [`change_gl_context`] or forgets this, so it can.
+    static CURRENT_SURFACE: std::cell::Cell<Option<glutin::surface::RawSurface>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Forget which surface is current, after a surface was dropped (a new
+/// window may get the old one's handle) or the context made not current.
+fn forget_current_surface() {
+    CURRENT_SURFACE.with(|surface| surface.set(None));
+}
+
 fn change_gl_context(
     current_gl_context: &mut Option<glutin::context::PossiblyCurrentContext>,
     not_current_gl_context: &mut Option<glutin::context::NotCurrentContext>,
     gl_surface: &glutin::surface::Surface<glutin::surface::WindowSurface>,
 ) {
+    use glutin::surface::AsRawSurface as _;
+
     profiling::function_scope!();
 
-    if !cfg!(target_os = "windows") {
-        // According to https://github.com/emilk/egui/issues/4289
-        // we cannot do this early-out on Windows.
-        // TODO(emilk): optimize context switching on Windows too.
-        // See https://github.com/emilk/egui/issues/4173
-
-        if let Some(current_gl_context) = current_gl_context {
-            profiling::scope!("is_current");
-            if gl_surface.is_current(current_gl_context) {
-                return; // Early-out to save a lot of time.
-            }
+    let raw_surface = gl_surface.raw_surface();
+    if let Some(current_gl_context) = current_gl_context {
+        profiling::scope!("is_current");
+        // On Windows, `is_current` only says that our context is current, so
+        // also check that it was last made current with this window. Making the
+        // context current again costs a driver call (two a frame otherwise,
+        // https://github.com/emilk/egui/issues/4173).
+        if gl_surface.is_current(current_gl_context)
+            && (!cfg!(target_os = "windows")
+                || CURRENT_SURFACE.with(std::cell::Cell::get) == Some(raw_surface))
+        {
+            return; // Early-out to save a lot of time.
         }
     }
 
@@ -1057,6 +1078,7 @@ fn change_gl_context(
 
     profiling::scope!("make_current");
     *current_gl_context = Some(not_current.make_current(gl_surface).unwrap());
+    CURRENT_SURFACE.with(|surface| surface.set(Some(raw_surface)));
 }
 
 impl GlutinWindowContext {
@@ -1383,6 +1405,11 @@ impl GlutinWindowContext {
                         .unwrap()
                 };
             let current_gl_context = not_current_gl_context.make_current(&gl_surface)?;
+            {
+                use glutin::surface::AsRawSurface as _;
+                let raw_surface = gl_surface.raw_surface();
+                CURRENT_SURFACE.with(|surface| surface.set(Some(raw_surface)));
+            }
 
             // try setting swap interval. but its not absolutely necessary, so don't panic on failure.
             log::trace!("made context current. setting swap interval for surface");
@@ -1412,6 +1439,7 @@ impl GlutinWindowContext {
             viewport.gl_surface = None;
             viewport.window = None;
         }
+        forget_current_surface();
         if let Some(current) = self.current_gl_context.take() {
             log::debug!("context is current, so making it non-current");
             self.not_current_gl_context = Some(current.make_not_current()?);
@@ -1467,8 +1495,13 @@ impl GlutinWindowContext {
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     ) {
         // GC old viewports
+        let count = self.viewports.len();
         self.viewports
             .retain(|id, _| viewport_output.contains_key(id));
+        if self.viewports.len() != count {
+            // A dropped surface's window handle may be reused by a new window.
+            forget_current_surface();
+        }
         self.viewport_from_window
             .retain(|_, id| viewport_output.contains_key(id));
         self.window_from_viewport
@@ -1592,6 +1625,7 @@ fn initialize_or_update_viewport(
                 viewport.window = None;
                 viewport.egui_winit = None;
                 viewport.gl_surface = None;
+                forget_current_surface();
             }
 
             viewport.deferred_commands.append(&mut delta_commands);
