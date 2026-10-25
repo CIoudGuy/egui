@@ -2872,6 +2872,19 @@ impl Context {
         shapes: Vec<ClippedShape>,
         pixels_per_point: f32,
     ) -> Vec<ClippedPrimitive> {
+        self.tessellate_with_buffers(shapes, pixels_per_point, &mut Default::default())
+    }
+
+    /// [`Self::tessellate`] into the meshes and scratch paths `buffers` kept from earlier
+    /// frames: give the primitives back with [`epaint::TessellatorBuffers::recycle`] once
+    /// they are painted, and the next frame fills their meshes instead of allocating and
+    /// growing new ones (and the old ones are not freed). Keep one per viewport.
+    pub fn tessellate_with_buffers(
+        &self,
+        shapes: Vec<ClippedShape>,
+        pixels_per_point: f32,
+        buffers: &mut epaint::TessellatorBuffers,
+    ) -> Vec<ClippedPrimitive> {
         profiling::function_scope!();
 
         // A tempting optimization is to reuse the tessellation from last frame if the
@@ -2894,13 +2907,16 @@ impl Context {
             let paint_stats = PaintStats::from_shapes(&shapes);
             let clipped_primitives = {
                 profiling::scope!("tessellator::tessellate_shapes");
-                tessellator::Tessellator::new(
+                let mut tessellator = tessellator::Tessellator::new(
                     pixels_per_point,
                     tessellation_options,
                     texture_atlas.size(),
                     texture_atlas.prepared_discs(),
                 )
-                .tessellate_shapes(shapes)
+                .with_buffers(core::mem::take(buffers));
+                let clipped_primitives = tessellator.tessellate_shapes(shapes);
+                *buffers = tessellator.into_buffers();
+                clipped_primitives
             };
             ctx.paint_stats = paint_stats.with_clipped_primitives(&clipped_primitives);
             clipped_primitives

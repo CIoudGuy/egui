@@ -114,6 +114,9 @@ pub struct Viewport {
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
+
+    /// The meshes of this viewport's last painted frame, filled again by the next one.
+    tessellator_buffers: egui::epaint::TessellatorBuffers,
 }
 
 impl Drop for Viewport {
@@ -350,6 +353,7 @@ impl<'app> WgpuWinitApp<'app> {
                 window: Some(window),
                 egui_winit: Some(egui_winit),
                 pending_delta: Default::default(),
+                tessellator_buffers: Default::default(),
             },
         );
 
@@ -817,7 +821,11 @@ impl WgpuWinitRunning<'_> {
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
         let vsync_secs = if is_visible {
-            let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+            let clipped_primitives = egui_ctx.tessellate_with_buffers(
+                shapes,
+                pixels_per_point,
+                &mut viewport.tessellator_buffers,
+            );
 
             let mut screenshot_commands = vec![];
             viewport.actions_requested.retain(|cmd| {
@@ -837,6 +845,7 @@ impl WgpuWinitRunning<'_> {
                 screenshot_commands,
                 window,
             );
+            viewport.tessellator_buffers.recycle(clipped_primitives);
 
             for action in viewport.actions_requested.drain(..) {
                 match action {
@@ -1382,6 +1391,7 @@ fn initialize_or_update_viewport<'a>(
                 window: None,
                 egui_winit: None,
                 pending_delta: Default::default(),
+                tessellator_buffers: Default::default(),
             })
         }
 

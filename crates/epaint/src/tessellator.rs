@@ -1316,6 +1316,95 @@ pub struct Tessellator {
 
     scratchpad_points: Vec<Pos2>,
     scratchpad_path: Path,
+
+    /// Empty meshes to fill before allocating new ones, the next one last.
+    mesh_pool: Vec<Mesh>,
+
+    /// How many meshes this tessellator has started, and for each primitive it made a mesh
+    /// for (by index in the output) which one it was: what [`TessellatorBuffers::recycle`]
+    /// needs to hand each mesh back to the same place next frame.
+    meshes_started: usize,
+    started: Vec<(usize, usize)>,
+
+    /// What [`Self::tessellate_shapes`] left for [`TessellatorBuffers::recycle`]: the place
+    /// of each primitive it returned, and the meshes it dropped empty, with their places.
+    returned_places: Vec<Option<usize>>,
+    dropped: Vec<(usize, Mesh)>,
+}
+
+/// What a [`Tessellator`] keeps from one frame to the next, so a frame allocates little.
+///
+/// That is the meshes of the primitives the renderer has finished with ([`Self::recycle`])
+/// and the tessellator's scratch paths. Hand them to [`Tessellator::with_buffers`] and take
+/// them back with [`Tessellator::into_buffers`].
+#[derive(Default)]
+pub struct TessellatorBuffers {
+    /// Meshes to reuse, the next one last.
+    meshes: Vec<Mesh>,
+    points: Vec<Pos2>,
+    path: Path,
+
+    /// How many meshes the last tessellation started, where each primitive it returned had
+    /// its mesh, and the meshes it dropped empty with their places.
+    meshes_started: usize,
+    returned_places: Vec<Option<usize>>,
+    dropped: Vec<(usize, Mesh)>,
+}
+
+impl TessellatorBuffers {
+    /// At most this many meshes are kept.
+    const MAX_MESHES: usize = 1024;
+
+    /// Keeps the meshes of `primitives` (what the last [`Tessellator::tessellate_shapes`]
+    /// returned), emptied, for the next frame. Each goes back to the place its primitive had
+    /// in the order the meshes were started, with the ones dropped empty in theirs: frames
+    /// repeat their shapes, so each mesh mostly gets the shapes it had and with them a
+    /// capacity that fits.
+    pub fn recycle(&mut self, primitives: Vec<ClippedPrimitive>) {
+        let mut placed: Vec<Option<Mesh>> = (0..self.meshes_started).map(|_| None).collect();
+        let mut unplaced = Vec::new();
+        let places = core::mem::take(&mut self.returned_places);
+        for (primitive, place) in primitives
+            .into_iter()
+            .zip(places.into_iter().chain(core::iter::repeat(None)))
+        {
+            if let Primitive::Mesh(mut mesh) = primitive.primitive {
+                shrink_unused(&mut mesh.indices);
+                shrink_unused(&mut mesh.vertices);
+                match place.and_then(|place| placed.get_mut(place)) {
+                    Some(slot @ None) => *slot = Some(mesh),
+                    _ => unplaced.push(mesh),
+                }
+            }
+        }
+        for (place, mesh) in core::mem::take(&mut self.dropped) {
+            if let Some(slot @ None) = placed.get_mut(place) {
+                *slot = Some(mesh);
+            }
+        }
+        // Meshes no primitive took this time stay below this frame's, in their order,
+        // for a frame with more primitives.
+        let mut pool = core::mem::take(&mut self.meshes);
+        pool.extend(unplaced);
+        pool.extend(placed.into_iter().rev().flatten());
+        let excess = pool.len().saturating_sub(Self::MAX_MESHES);
+        pool.drain(..excess);
+        for mesh in &mut pool {
+            mesh.indices.clear();
+            mesh.vertices.clear();
+            mesh.texture_id = TextureId::default();
+        }
+        self.meshes = pool;
+        self.meshes_started = 0;
+    }
+}
+
+/// Gives back most of a buffer that held far less than it can: a mesh can get another
+/// primitive's shapes when a frame's primitives change.
+fn shrink_unused<T>(buffer: &mut Vec<T>) {
+    if buffer.capacity() > 4 * buffer.len() + 4096 {
+        buffer.shrink_to(2 * buffer.len());
+    }
 }
 
 impl Tessellator {
@@ -1347,6 +1436,43 @@ impl Tessellator {
             clip_rect: Rect::EVERYTHING,
             scratchpad_points: Default::default(),
             scratchpad_path: Default::default(),
+            mesh_pool: Vec::new(),
+            meshes_started: 0,
+            started: Vec::new(),
+            returned_places: Vec::new(),
+            dropped: Vec::new(),
+        }
+    }
+
+    /// Tessellates into the meshes and scratch paths in `buffers` before allocating new ones.
+    #[must_use]
+    pub fn with_buffers(mut self, buffers: TessellatorBuffers) -> Self {
+        let TessellatorBuffers {
+            meshes,
+            mut points,
+            mut path,
+            meshes_started: _,
+            returned_places: _,
+            dropped: _,
+        } = buffers;
+        points.clear();
+        path.clear();
+        self.mesh_pool = meshes;
+        self.scratchpad_points = points;
+        self.scratchpad_path = path;
+        self
+    }
+
+    /// The meshes this tessellator did not use and its scratch paths, for
+    /// [`Self::with_buffers`] next frame.
+    pub fn into_buffers(self) -> TessellatorBuffers {
+        TessellatorBuffers {
+            meshes: self.mesh_pool,
+            points: self.scratchpad_points,
+            path: self.scratchpad_path,
+            meshes_started: self.meshes_started,
+            returned_places: self.returned_places,
+            dropped: self.dropped,
         }
     }
 
@@ -1396,9 +1522,12 @@ impl Tessellator {
         };
 
         if start_new_mesh {
+            self.started
+                .push((out_primitives.len(), self.meshes_started));
+            self.meshes_started += 1;
             out_primitives.push(ClippedPrimitive {
                 clip_rect,
-                primitive: Primitive::Mesh(Mesh::default()),
+                primitive: Primitive::Mesh(self.mesh_pool.pop().unwrap_or_default()),
             });
         }
 
@@ -2226,6 +2355,8 @@ impl Tessellator {
         }
 
         let mut clipped_primitives: Vec<ClippedPrimitive> = Vec::default();
+        self.started.clear();
+        self.meshes_started = 0;
 
         {
             profiling::scope!("tessellate");
@@ -2236,6 +2367,7 @@ impl Tessellator {
 
         if self.options.debug_paint_clip_rects {
             clipped_primitives = self.add_clip_rects(clipped_primitives);
+            self.started.clear(); // the primitives moved
         }
 
         if self.options.debug_ignore_clip_rects {
@@ -2244,13 +2376,29 @@ impl Tessellator {
             }
         }
 
-        clipped_primitives.retain(|p| {
-            p.clip_rect.is_positive()
-                && match &p.primitive {
+        // Leave out empty primitives, noting where each mesh started for the next frame.
+        let mut started = self.started.drain(..).peekable();
+        self.returned_places.clear();
+        self.dropped.clear();
+        let mut kept = Vec::with_capacity(clipped_primitives.len());
+        for (index, primitive) in clipped_primitives.into_iter().enumerate() {
+            let place = started
+                .next_if(|(started_at, _)| *started_at == index)
+                .map(|(_, place)| place);
+            let keep = primitive.clip_rect.is_positive()
+                && match &primitive.primitive {
                     Primitive::Mesh(mesh) => !mesh.is_empty(),
                     Primitive::Callback(_) => true,
-                }
-        });
+                };
+            if keep {
+                self.returned_places.push(place);
+                kept.push(primitive);
+            } else if let (Primitive::Mesh(mesh), Some(place)) = (primitive.primitive, place) {
+                self.dropped.push((place, mesh));
+            }
+        }
+        drop(started);
+        let clipped_primitives = kept;
 
         for clipped_primitive in &clipped_primitives {
             if let Primitive::Mesh(mesh) = &clipped_primitive.primitive {
@@ -2418,4 +2566,113 @@ fn path_bounding_box() {
             &mut mesh,
         );
     }
+}
+
+#[test]
+fn kept_meshes_are_filled_again_with_the_same_triangles() {
+    let shapes = || {
+        vec![
+            ClippedShape {
+                clip_rect: Rect::EVERYTHING,
+                shape: Shape::rect_filled(
+                    Rect::from_min_size(pos2(1.0, 2.0), Vec2::splat(30.0)),
+                    4.0,
+                    Color32::RED,
+                ),
+            },
+            ClippedShape {
+                clip_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(20.0)),
+                shape: Shape::circle_filled(pos2(5.0, 5.0), 3.0, Color32::BLUE),
+            },
+        ]
+    };
+    let tessellator = || Tessellator::new(1.5, TessellationOptions::default(), [1, 1], vec![]);
+    let plain = tessellator().tessellate_shapes(shapes());
+
+    let mut buffers = TessellatorBuffers::default();
+    for _ in 0..3 {
+        let mut pooled = tessellator().with_buffers(core::mem::take(&mut buffers));
+        let primitives = pooled.tessellate_shapes(shapes());
+        buffers = pooled.into_buffers();
+        assert_eq!(primitives.len(), plain.len());
+        for (a, b) in primitives.iter().zip(&plain) {
+            assert_eq!(a.clip_rect, b.clip_rect);
+            let (Primitive::Mesh(a), Primitive::Mesh(b)) = (&a.primitive, &b.primitive) else {
+                panic!("meshes expected");
+            };
+            assert_eq!(a, b);
+        }
+        let addresses: Vec<_> = primitives
+            .iter()
+            .map(|p| match &p.primitive {
+                Primitive::Mesh(mesh) => mesh.vertices.as_ptr(),
+                Primitive::Callback(_) => core::ptr::null(),
+            })
+            .collect();
+        buffers.recycle(primitives);
+        // The next frame takes the same buffers back, in the same order.
+        let kept: Vec<_> = buffers
+            .meshes
+            .iter()
+            .rev()
+            .map(|m| m.vertices.as_ptr())
+            .collect();
+        assert_eq!(kept, addresses);
+        assert!(buffers.meshes.iter().all(Mesh::is_empty));
+    }
+}
+
+#[test]
+fn a_primitive_left_out_empty_keeps_the_others_meshes_in_place() {
+    let big = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(400.0));
+    let small = Rect::from_min_size(pos2(500.0, 0.0), Vec2::splat(10.0));
+    let shapes = |culled: bool| {
+        vec![
+            ClippedShape {
+                clip_rect: big,
+                shape: Shape::rect_filled(big, 40.0, Color32::RED),
+            },
+            // Outside its clip rectangle when culled: an empty mesh, left out.
+            ClippedShape {
+                clip_rect: Rect::from_min_size(pos2(0.0, 600.0), Vec2::splat(50.0)),
+                shape: Shape::circle_filled(
+                    if culled {
+                        pos2(1000.0, 1000.0)
+                    } else {
+                        pos2(10.0, 610.0)
+                    },
+                    3.0,
+                    Color32::BLUE,
+                ),
+            },
+            ClippedShape {
+                clip_rect: small,
+                shape: Shape::rect_filled(small, 2.0, Color32::GREEN),
+            },
+        ]
+    };
+    let mut buffers = TessellatorBuffers::default();
+    let frame = |culled: bool, buffers: &mut TessellatorBuffers| {
+        let mut tessellator = Tessellator::new(1.0, TessellationOptions::default(), [1, 1], vec![])
+            .with_buffers(core::mem::take(buffers));
+        let primitives = tessellator.tessellate_shapes(shapes(culled));
+        *buffers = tessellator.into_buffers();
+        let addresses: Vec<_> = primitives
+            .iter()
+            .map(|p| match &p.primitive {
+                Primitive::Mesh(mesh) => (mesh.vertices.as_ptr(), mesh.vertices.capacity()),
+                Primitive::Callback(_) => (core::ptr::null(), 0),
+            })
+            .collect();
+        buffers.recycle(primitives);
+        addresses
+    };
+    let first = frame(false, &mut buffers);
+    assert_eq!(first.len(), 3);
+    // The middle one is culled now: the outer two keep their buffers.
+    let second = frame(true, &mut buffers);
+    assert_eq!(second, [first[0], first[2]]);
+    // And the middle one gets its own back when it shows again.
+    let third = frame(false, &mut buffers);
+    assert_eq!(third, first);
 }

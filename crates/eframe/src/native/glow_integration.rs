@@ -138,6 +138,9 @@ struct Viewport {
     gl_surface: Option<glutin::surface::Surface<glutin::surface::WindowSurface>>,
     window: Option<Arc<Window>>,
     egui_winit: Option<egui_winit::State>,
+
+    /// The meshes of this viewport's last painted frame, filled again by the next one.
+    tessellator_buffers: egui::epaint::TessellatorBuffers,
 }
 
 impl Viewport {
@@ -804,7 +807,11 @@ impl GlowWinitRunning<'_> {
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
         if is_visible {
-            let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
+            let clipped_primitives = integration.egui_ctx.tessellate_with_buffers(
+                shapes,
+                pixels_per_point,
+                &mut viewport.tessellator_buffers,
+            );
 
             {
                 // We may need to switch contexts again, because of immediate viewports:
@@ -833,6 +840,7 @@ impl GlowWinitRunning<'_> {
                 &clipped_primitives,
                 pending_deltas,
             );
+            viewport.tessellator_buffers.recycle(clipped_primitives);
 
             {
                 for action in viewport.actions_requested.drain(..) {
@@ -1268,6 +1276,7 @@ impl GlutinWindowContext {
                 gl_surface: None,
                 window: window.map(Arc::new),
                 egui_winit: None,
+                tessellator_buffers: Default::default(),
             },
         );
 
@@ -1620,6 +1629,7 @@ fn initialize_or_update_viewport(
                 window: None,
                 egui_winit: None,
                 gl_surface: None,
+                tessellator_buffers: Default::default(),
             })
         }
 
