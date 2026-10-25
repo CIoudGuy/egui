@@ -1330,6 +1330,9 @@ pub struct Tessellator {
     /// of each primitive it returned, and the meshes it dropped empty, with their places.
     returned_places: Vec<Option<usize>>,
     dropped: Vec<(usize, Mesh)>,
+
+    /// Blurred rectangles (shadows) by size, kept between frames with the buffers.
+    blurred_rects: crate::blurred_rect::BlurredRectCache,
 }
 
 /// What a [`Tessellator`] keeps from one frame to the next, so a frame allocates little.
@@ -1349,6 +1352,8 @@ pub struct TessellatorBuffers {
     meshes_started: usize,
     returned_places: Vec<Option<usize>>,
     dropped: Vec<(usize, Mesh)>,
+
+    blurred_rects: crate::blurred_rect::BlurredRectCache,
 }
 
 impl TessellatorBuffers {
@@ -1361,6 +1366,7 @@ impl TessellatorBuffers {
     /// repeat their shapes, so each mesh mostly gets the shapes it had and with them a
     /// capacity that fits.
     pub fn recycle(&mut self, primitives: Vec<ClippedPrimitive>) {
+        self.blurred_rects.end_frame();
         let mut placed: Vec<Option<Mesh>> = (0..self.meshes_started).map(|_| None).collect();
         let mut unplaced = Vec::new();
         let places = core::mem::take(&mut self.returned_places);
@@ -1441,6 +1447,7 @@ impl Tessellator {
             started: Vec::new(),
             returned_places: Vec::new(),
             dropped: Vec::new(),
+            blurred_rects: Default::default(),
         }
     }
 
@@ -1454,12 +1461,14 @@ impl Tessellator {
             meshes_started: _,
             returned_places: _,
             dropped: _,
+            blurred_rects,
         } = buffers;
         points.clear();
         path.clear();
         self.mesh_pool = meshes;
         self.scratchpad_points = points;
         self.scratchpad_path = path;
+        self.blurred_rects = blurred_rects;
         self
     }
 
@@ -1473,6 +1482,7 @@ impl Tessellator {
             meshes_started: self.meshes_started,
             returned_places: self.returned_places,
             dropped: self.dropped,
+            blurred_rects: self.blurred_rects,
         }
     }
 
@@ -1988,6 +1998,16 @@ impl Tessellator {
                     rect = rect.round_to_pixels(self.pixels_per_point);
                 }
             }
+        }
+
+        if self.feathering < blur_width && stroke.is_empty() && brush.is_none() && angle == 0.0 {
+            // A shadow or a glow: blurred as CSS blurs a box-shadow.
+            if fill != Color32::TRANSPARENT {
+                self.blurred_rects
+                    .get(rect.size(), corner_radius, 0.5 * blur_width)
+                    .append_to(rect.center(), fill, out);
+            }
+            return;
         }
 
         let old_feathering = self.feathering;

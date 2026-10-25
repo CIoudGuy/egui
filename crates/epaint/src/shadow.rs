@@ -14,7 +14,8 @@ pub struct Shadow {
     /// causing a drop-shadow effect.
     pub offset: [i8; 2],
 
-    /// The width of the blur, i.e. the width of the fuzzy penumbra.
+    /// The blur radius, as in a CSS `box-shadow`: the shadow fades as a Gaussian with half of
+    /// this as standard deviation, over one and a half times this on either side of its edge.
     ///
     /// A value of 0 means a sharp shadow.
     pub blur: u8,
@@ -75,11 +76,12 @@ impl Shadow {
         let spread = spread as f32;
         let blur = blur as f32;
         let [offset_x, offset_y] = offset;
+        // The blur fades over three standard deviations, half the blur each.
         MarginF32 {
-            left: spread + 0.5 * blur - offset_x as f32,
-            right: spread + 0.5 * blur + offset_x as f32,
-            top: spread + 0.5 * blur - offset_y as f32,
-            bottom: spread + 0.5 * blur + offset_y as f32,
+            left: spread + 1.5 * blur - offset_x as f32,
+            right: spread + 1.5 * blur + offset_x as f32,
+            top: spread + 1.5 * blur - offset_y as f32,
+            bottom: spread + 1.5 * blur + offset_y as f32,
         }
     }
 }

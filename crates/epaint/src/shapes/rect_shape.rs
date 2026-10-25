@@ -46,7 +46,11 @@ pub struct RectShape {
     ///
     /// This can be used to produce shadows and glow effects.
     ///
-    /// The blur is currently implemented using a simple linear blur in sRGBA gamma space.
+    /// A rectangle with only a fill (a shadow or a glow) is blurred as CSS blurs a
+    /// `box-shadow` with this blur radius: by a Gaussian with half of it as standard
+    /// deviation, so its edge fades over one and a half times this on either side of the
+    /// outline. With a stroke, a brush or an angle, the edges fade linearly over this width
+    /// instead, in sRGBA gamma space.
     pub blur_width: f32,
 
     /// Controls texturing, if any.
@@ -191,7 +195,13 @@ impl RectShape {
                 StrokeKind::Middle => self.stroke.width / 2.0,
                 StrokeKind::Outside => self.stroke.width,
             };
-            let expanded = self.rect.expand(expand + self.blur_width / 2.0);
+            // A blurred fill fades over three standard deviations, half the blur each.
+            let blur = if self.stroke.is_empty() && self.brush.is_none() && self.angle == 0.0 {
+                1.5 * self.blur_width
+            } else {
+                self.blur_width / 2.0
+            };
+            let expanded = self.rect.expand(expand + blur);
             if self.angle == 0.0 {
                 expanded
             } else {

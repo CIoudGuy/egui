@@ -23,6 +23,7 @@
 #![expect(clippy::float_cmp)]
 #![expect(clippy::manual_range_contains)]
 
+mod blurred_rect;
 mod brush;
 pub mod color;
 mod corner_radius;
@@ -47,6 +48,7 @@ pub mod util;
 mod viewport;
 
 pub use self::{
+    blurred_rect::{BlurredRectMesh, tessellate_blurred_rect},
     brush::Brush,
     color::ColorMode,
     corner_radius::CornerRadius,
