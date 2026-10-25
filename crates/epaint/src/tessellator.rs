@@ -2057,30 +2057,27 @@ impl Tessellator {
             let min_inside_cr = 0.1; // Large enough to avoid numerical issues
             let min_outside_cr = stroke.width + min_inside_cr;
 
-            let extra_cr_tweak = 0.4; // Otherwise is doesn't _feels_  enough.
+            // The corners keep the radius asked for, as Chromium draws a border-radius
+            // (egui added 0.4 here, which made small corners visibly rounder than CSS's).
 
             if original_cr.nw == 0.0 {
                 corner_radius.nw = 0.0;
             } else {
-                corner_radius.nw += extra_cr_tweak;
                 corner_radius.nw = corner_radius.nw.at_least(min_outside_cr);
             }
             if original_cr.ne == 0.0 {
                 corner_radius.ne = 0.0;
             } else {
-                corner_radius.ne += extra_cr_tweak;
                 corner_radius.ne = corner_radius.ne.at_least(min_outside_cr);
             }
             if original_cr.sw == 0.0 {
                 corner_radius.sw = 0.0;
             } else {
-                corner_radius.sw += extra_cr_tweak;
                 corner_radius.sw = corner_radius.sw.at_least(min_outside_cr);
             }
             if original_cr.se == 0.0 {
                 corner_radius.se = 0.0;
             } else {
-                corner_radius.se += extra_cr_tweak;
                 corner_radius.se = corner_radius.se.at_least(min_outside_cr);
             }
         }
@@ -2695,4 +2692,27 @@ fn a_primitive_left_out_empty_keeps_the_others_meshes_in_place() {
     // And the middle one gets its own back when it shows again.
     let third = frame(false, &mut buffers);
     assert_eq!(third, first);
+}
+
+#[test]
+fn a_rounded_corner_has_the_radius_asked_for() {
+    // A filled rectangle's outline sits half a pixel outside the corner arc (its
+    // feathering): at the top left, the arc's middle is at 8 - 8.5 / sqrt(2) in x and y.
+    let mut mesh = Mesh::default();
+    let mut tessellator = Tessellator::new(1.0, TessellationOptions::default(), [1, 1], vec![]);
+    tessellator.tessellate_shape(
+        Shape::rect_filled(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+            8.0,
+            Color32::WHITE,
+        ),
+        &mut mesh,
+    );
+    let nearest = mesh
+        .vertices
+        .iter()
+        .map(|v| v.pos.x + v.pos.y)
+        .fold(f32::INFINITY, f32::min);
+    let expected = 2.0 * (8.0 - 8.5 / core::f32::consts::SQRT_2);
+    assert!((nearest - expected).abs() < 0.05, "{nearest} vs {expected}");
 }
