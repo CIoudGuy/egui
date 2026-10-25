@@ -314,9 +314,16 @@ pub use crate::generate_loader_id;
 /// This is useful when implementing an [`ImageLoader`].
 pub fn has_extension(uri: &str, extension: &str) -> bool {
     let path = uri.split('#').next().unwrap_or(uri);
-    std::path::Path::new(path)
-        .extension()
-        .is_some_and(|found| found.eq_ignore_ascii_case(extension))
+    // What `std::path::Path::extension` finds, without parsing the whole path (texture
+    // loaders ask for every image every frame): the text after the last dot of the last
+    // component, unless that dot starts the name.
+    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let path = path.trim_end_matches(is_separator);
+    let name = path.rsplit(is_separator).next().unwrap_or(path);
+    name != ".."
+        && name
+            .rsplit_once('.')
+            .is_some_and(|(stem, found)| !stem.is_empty() && found.eq_ignore_ascii_case(extension))
 }
 
 pub type BytesLoadResult = Result<BytesPoll>;
@@ -662,4 +669,39 @@ fn test_has_extension() {
     assert!(!has_extension("svg", "svg"));
     assert!(!has_extension("cat.jpeg", "jpg"));
     assert!(!has_extension("cat.svg?v=1", "svg"));
+}
+
+#[test]
+fn has_extension_finds_what_path_finds() {
+    let uris = [
+        "cat.svg",
+        "https://resources.tidal.com/images/ab/cd/320x320.jpg",
+        "file:///C:/art/cover.SVG",
+        r"C:\art\cover.svg",
+        r"C:\art.d\cover",
+        "dir/.svg",
+        ".svg",
+        "a.b.svg",
+        "dir.svg/",
+        "dir/",
+        "..",
+        "../up.svg",
+        "x.",
+        "bytes://data.svg",
+        "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+        "",
+    ];
+    for uri in uris {
+        for extension in ["svg", "jpg", ""] {
+            let path = uri.split('#').next().unwrap_or(uri);
+            let by_path = std::path::Path::new(path)
+                .extension()
+                .is_some_and(|found| found.eq_ignore_ascii_case(extension));
+            assert_eq!(
+                has_extension(uri, extension),
+                by_path,
+                "{uri:?} {extension:?}"
+            );
+        }
+    }
 }
