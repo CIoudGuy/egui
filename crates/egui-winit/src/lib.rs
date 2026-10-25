@@ -131,6 +131,43 @@ pub struct State {
     /// for details.
     #[cfg(target_os = "windows")]
     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
+
+    /// Whether [`Self::update_viewport_info`] has to read the window again: set by the
+    /// window events that change what it reads and by [`Self::invalidate_viewport_info`].
+    viewport_info_stale: bool,
+
+    /// When [`Self::update_viewport_info`] last read the window, and at what points per
+    /// pixel.
+    viewport_info_read: Option<(web_time::Instant, f32)>,
+}
+
+/// How long [`State::update_viewport_info`] trusts what it read, for what can change without
+/// a window event (another program setting the title, a monitor's resolution).
+const VIEWPORT_INFO_MAX_AGE: web_time::Duration = web_time::Duration::from_millis(500);
+
+/// Whether `event` can change what [`update_viewport_info`] reads from the window.
+fn changes_viewport_info(event: &winit::event::WindowEvent) -> bool {
+    use winit::event::WindowEvent;
+    matches!(
+        event,
+        WindowEvent::Resized(_)
+            | WindowEvent::Moved(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Focused(_)
+            | WindowEvent::Occluded(_)
+    )
+}
+
+/// Whether what was read at `read` (when, at what points per pixel) still holds at `now`.
+fn viewport_info_fresh(
+    read: Option<(web_time::Instant, f32)>,
+    pixels_per_point: f32,
+    now: web_time::Instant,
+) -> bool {
+    read.is_some_and(|(read, read_pixels_per_point)| {
+        read_pixels_per_point == pixels_per_point
+            && now.duration_since(read) < VIEWPORT_INFO_MAX_AGE
+    })
 }
 
 impl State {
@@ -178,6 +215,9 @@ impl State {
             old_ime_purpose: egui::IMEPurpose::Normal,
             #[cfg(target_os = "windows")]
             pressed_processed_physical_keys: HashSet::new(),
+
+            viewport_info_stale: true,
+            viewport_info_read: None,
         };
 
         slf.egui_input
@@ -289,6 +329,31 @@ impl State {
         self.egui_input.take()
     }
 
+    /// [`update_viewport_info`] for this state's window, skipped while nothing it reads can
+    /// have changed: the window is read again after a window event that changes its size,
+    /// position, scale, focus or occlusion, after [`Self::invalidate_viewport_info`], when
+    /// the zoom changes the points per pixel, and at least every half second for what changes
+    /// without an event. Reading it costs several system calls, one of them a message to the
+    /// window for its title, every frame.
+    pub fn update_viewport_info(&mut self, viewport_info: &mut ViewportInfo, window: &Window) {
+        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        let now = web_time::Instant::now();
+        if !self.viewport_info_stale
+            && viewport_info_fresh(self.viewport_info_read, pixels_per_point, now)
+        {
+            return;
+        }
+        update_viewport_info(viewport_info, &self.egui_ctx, window, false);
+        self.viewport_info_stale = false;
+        self.viewport_info_read = Some((now, pixels_per_point));
+    }
+
+    /// Makes the next [`Self::update_viewport_info`] read the window, as after viewport
+    /// commands, which can change it without an event (its title, say).
+    pub fn invalidate_viewport_info(&mut self) {
+        self.viewport_info_stale = true;
+    }
+
     /// Call this when there is a new event.
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
@@ -305,6 +370,10 @@ impl State {
         }
 
         use winit::event::WindowEvent;
+
+        if changes_viewport_info(event) {
+            self.viewport_info_stale = true;
+        }
 
         #[cfg(target_os = "ios")]
         match &event {
@@ -2347,5 +2416,40 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+    }
+}
+
+#[cfg(test)]
+mod viewport_info_tests {
+    use super::*;
+    use winit::event::WindowEvent;
+
+    #[test]
+    fn the_window_is_read_again_only_when_something_may_have_changed() {
+        let read = web_time::Instant::now();
+        let at = |ms| read + web_time::Duration::from_millis(ms);
+        // Nothing read yet.
+        assert!(!viewport_info_fresh(None, 1.5, read));
+        // Kept for a while at the same scale...
+        assert!(viewport_info_fresh(Some((read, 1.5)), 1.5, at(16)));
+        assert!(viewport_info_fresh(Some((read, 1.5)), 1.5, at(499)));
+        // ...read again when the zoom changes the points per pixel...
+        assert!(!viewport_info_fresh(Some((read, 1.5)), 1.75, at(16)));
+        // ...and twice a second whatever happens.
+        assert!(!viewport_info_fresh(Some((read, 1.5)), 1.5, at(500)));
+    }
+
+    #[test]
+    fn window_changes_make_it_stale_and_input_does_not() {
+        let size = winit::dpi::PhysicalSize::new(800, 600);
+        let position = winit::dpi::PhysicalPosition::new(10, 20);
+        assert!(changes_viewport_info(&WindowEvent::Resized(size)));
+        assert!(changes_viewport_info(&WindowEvent::Moved(position)));
+        assert!(changes_viewport_info(&WindowEvent::Focused(false)));
+        assert!(changes_viewport_info(&WindowEvent::Occluded(true)));
+        assert!(!changes_viewport_info(&WindowEvent::RedrawRequested));
+        assert!(!changes_viewport_info(&WindowEvent::CursorLeft {
+            device_id: winit::event::DeviceId::dummy(),
+        }));
     }
 }

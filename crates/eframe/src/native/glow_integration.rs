@@ -149,7 +149,9 @@ impl Viewport {
     ) {
         self.deferred_commands.append(&mut commands);
 
-        if let Some(window) = &self.window {
+        if let Some(window) = &self.window
+            && !self.deferred_commands.is_empty()
+        {
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut self.info,
@@ -157,6 +159,9 @@ impl Viewport {
                 window,
                 &mut self.actions_requested,
             );
+            if let Some(egui_winit) = &mut self.egui_winit {
+                egui_winit.invalidate_viewport_info();
+            }
         }
     }
 }
@@ -624,7 +629,11 @@ impl GlowWinitRunning<'_> {
             let Some(window) = viewport.window.as_ref() else {
                 return Ok(EventResult::Wait);
             };
-            egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
+            if let Some(egui_winit) = viewport.egui_winit.as_mut() {
+                egui_winit.update_viewport_info(&mut viewport.info, window);
+            } else {
+                egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
+            }
 
             let is_visible = viewport.info.visible().unwrap_or(true);
 
@@ -1716,7 +1725,7 @@ fn render_immediate_viewport(
         let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
             return;
         };
-        egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+        egui_winit.update_viewport_info(&mut viewport.info, window);
 
         let mut raw_input = egui_winit.take_egui_input(window);
         raw_input.viewports = glutin

@@ -682,7 +682,11 @@ impl WgpuWinitRunning<'_> {
             let Some(window) = window else {
                 return Ok(EventResult::Wait);
             };
-            egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
+            if let Some(egui_winit) = egui_winit.as_mut() {
+                egui_winit.update_viewport_info(info, window);
+            } else {
+                egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
+            }
 
             let is_visible = viewport.info.visible().unwrap_or(true);
 
@@ -1057,7 +1061,9 @@ impl Viewport {
     ) {
         self.deferred_commands.append(&mut commands);
 
-        if let Some(window) = self.window.as_ref() {
+        if let Some(window) = self.window.as_ref()
+            && !self.deferred_commands.is_empty()
+        {
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut self.info,
@@ -1065,6 +1071,9 @@ impl Viewport {
                 window,
                 &mut self.actions_requested,
             );
+            if let Some(egui_winit) = &mut self.egui_winit {
+                egui_winit.invalidate_viewport_info();
+            }
         }
     }
 
@@ -1195,7 +1204,7 @@ fn render_immediate_viewport(
         let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
             return;
         };
-        egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+        egui_winit.update_viewport_info(&mut viewport.info, window);
 
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
