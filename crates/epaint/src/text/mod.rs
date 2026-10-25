@@ -52,6 +52,11 @@ pub struct TextOptions {
     ///
     /// Default: `true`.
     pub subpixel_binning: bool,
+
+    /// How glyph outlines become pixel coverage.
+    ///
+    /// Default: [`GlyphRasterization::Symmetric`].
+    pub glyph_rasterization: GlyphRasterization,
 }
 
 impl Default for TextOptions {
@@ -61,6 +66,25 @@ impl Default for TextOptions {
             color_transfer_function: crate::FontColorTransferFunction::default(),
             font_hinting: true,
             subpixel_binning: true,
+            glyph_rasterization: GlyphRasterization::default(),
         }
     }
+}
+
+/// How glyph outlines become pixel coverage, see [`TextOptions::glyph_rasterization`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum GlyphRasterization {
+    /// Antialiased in both directions: a pixel's coverage is the share of its area the
+    /// glyph covers.
+    #[default]
+    Symmetric,
+
+    /// Antialiased horizontally only, as `DirectWrite`'s natural rendering mode draws text on
+    /// Windows (Chromium uses it for fonts whose `gasp` table does not ask for symmetric
+    /// smoothing): each pixel row samples the outline once, along its middle, so horizontal
+    /// edges and the tops and bottoms of round letters fall on whole rows, and each row's
+    /// coverage is spread over the neighbouring sub-pixels by the `ClearType` filter and averaged
+    /// to gray. Text looks crisper, with the same weight.
+    HorizontalOnly,
 }

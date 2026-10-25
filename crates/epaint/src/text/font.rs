@@ -10,7 +10,7 @@ use vello_cpu::{color, kurbo};
 use crate::{
     TextOptions, TextureAtlas,
     text::{
-        FontTweak, VariationCoords,
+        FontTweak, GlyphRasterization, VariationCoords,
         fonts::{Blob, CachedFamily, FontFaceKey},
     },
 };
@@ -263,22 +263,46 @@ impl FontCell {
             Some(())
         })?;
 
-        let bounds = path.control_box().expand();
+        let horizontal_only =
+            atlas.options().glyph_rasterization == GlyphRasterization::HorizontalOnly;
+        let mut bounds = path.control_box().expand();
+        if horizontal_only {
+            // ClearType's filter spreads coverage up to two thirds of a pixel sideways.
+            bounds.x0 -= 1.0;
+            bounds.x1 += 1.0;
+        }
         let width = bounds.width() as u16;
         let height = bounds.height() as u16;
 
         let uv_rect = if width == 0 || height == 0 {
             UvRect::default()
         } else {
-            let mut ctx = vello_cpu::RenderContext::new(width, height);
-            ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
-            ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
-            ctx.fill_path(&path);
-            let mut dest = vello_cpu::Pixmap::new(width, height);
-            let mut resources = vello_cpu::Resources::new();
-            ctx.render(&mut dest, &mut resources);
+            let glyph_pos = if horizontal_only {
+                let coverage = rasterize_rows(
+                    &path,
+                    (bounds.x0, bounds.y0),
+                    width as usize,
+                    height as usize,
+                );
+                let color_transfer_function = atlas.options().color_transfer_function;
+                let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let c = coverage[y * width as usize + x];
+                        image[(x + glyph_pos.0, y + glyph_pos.1)] = color_transfer_function
+                            .to_atlas_color(Color32::from_rgba_premultiplied(c, c, c, c));
+                    }
+                }
+                glyph_pos
+            } else {
+                let mut ctx = vello_cpu::RenderContext::new(width, height);
+                ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
+                ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
+                ctx.fill_path(&path);
+                let mut dest = vello_cpu::Pixmap::new(width, height);
+                let mut resources = vello_cpu::Resources::new();
+                ctx.render(&mut dest, &mut resources);
 
-            let glyph_pos = {
                 let color_transfer_function = atlas.options().color_transfer_function;
                 let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
                 let pixels = dest.data_as_u8_slice();
@@ -312,6 +336,121 @@ impl FontCell {
 
         Some(GlyphAllocation { uv_rect })
     }
+}
+
+/// [`GlyphRasterization::HorizontalOnly`]: the coverage of `path` (in pixels, y down, with
+/// `origin` the bitmap's top left corner) as `DirectWrite`'s natural mode makes it for
+/// Chromium's grayscale text: the outline is sampled once per pixel row, along the row's
+/// middle; each third of a pixel gets the length of the row's inside it, the `ClearType` filter
+/// spreads that over the sub-pixel on each side, and a pixel is the mean of its three
+/// sub-pixels. Together: sub-pixels weighted 1, 2, 3, 2, 1 (ninths) around the pixel's middle.
+///
+/// Fitted to Chrome 155 drawing Hanken Grotesk at 1, 1.25 and 1.5 device pixels per CSS pixel
+/// in that mode: sampling at the row's middle and this filter came closest.
+fn rasterize_rows(
+    path: &kurbo::BezPath,
+    origin: (f64, f64),
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    const WEIGHTS: [f32; 5] = [1.0 / 9.0, 2.0 / 9.0, 3.0 / 9.0, 2.0 / 9.0, 1.0 / 9.0];
+
+    // The outline as line segments in the bitmap's coordinates. Horizontal ones are left
+    // out: a row's middle line never runs along one that changes the winding.
+    let mut edges: Vec<[f64; 4]> = Vec::new();
+    let mut start = kurbo::Point::ZERO;
+    let mut last = kurbo::Point::ZERO;
+    let mut add_edge = |a: kurbo::Point, b: kurbo::Point| {
+        if a.y != b.y {
+            edges.push([
+                a.x - origin.0,
+                a.y - origin.1,
+                b.x - origin.0,
+                b.y - origin.1,
+            ]);
+        }
+    };
+    kurbo::flatten(path, 0.01, |el| match el {
+        kurbo::PathEl::MoveTo(p) => {
+            add_edge(last, start);
+            start = p;
+            last = p;
+        }
+        kurbo::PathEl::LineTo(p) => {
+            add_edge(last, p);
+            last = p;
+        }
+        kurbo::PathEl::ClosePath => {
+            add_edge(last, start);
+            last = start;
+        }
+        kurbo::PathEl::QuadTo(..) | kurbo::PathEl::CurveTo(..) => {}
+    });
+    add_edge(last, start);
+
+    let subs = width * 3;
+    let mut sub = vec![0.0f32; subs];
+    let mut crossings: Vec<(f64, i32)> = Vec::new();
+    let mut out = vec![0u8; width * height];
+    for (row, out) in out.chunks_exact_mut(width).enumerate() {
+        let y = row as f64 + 0.5;
+        crossings.clear();
+        for &[x0, y0, x1, y1] in &edges {
+            let (lo, hi, dir) = if y0 < y1 { (y0, y1, 1) } else { (y1, y0, -1) };
+            if lo <= y && y < hi {
+                crossings.push((x0 + (y - y0) / (y1 - y0) * (x1 - x0), dir));
+            }
+        }
+        if crossings.is_empty() {
+            continue;
+        }
+        crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sub.fill(0.0);
+        // Non-zero winding, as glyph outlines are filled.
+        let mut winding = 0;
+        let mut span_start = 0.0;
+        for &(x, dir) in &crossings {
+            let before = winding;
+            winding += dir;
+            if before == 0 && winding != 0 {
+                span_start = x;
+            } else if before != 0 && winding == 0 {
+                add_span(&mut sub, span_start * 3.0, x * 3.0);
+            }
+        }
+        for (x, out) in out.iter_mut().enumerate() {
+            let mut coverage = 0.0;
+            for (k, weight) in WEIGHTS.iter().enumerate() {
+                if let Some(s) = (3 * x + k).checked_sub(1)
+                    && let Some(sub) = sub.get(s)
+                {
+                    coverage += weight * sub.min(1.0);
+                }
+            }
+            *out = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Adds the span from `a` to `b` (in sub-pixels) to each sub-pixel it covers, by length.
+fn add_span(sub: &mut [f32], a: f64, b: f64) {
+    let len = sub.len() as f64;
+    let (a, b) = (a.clamp(0.0, len), b.clamp(0.0, len));
+    if b <= a {
+        return;
+    }
+    let first = a as usize;
+    let last = (b.ceil() as usize).min(sub.len()).max(first + 1) - 1;
+    if first == last {
+        sub[first] += (b - a) as f32;
+        return;
+    }
+    sub[first] += (first as f64 + 1.0 - a) as f32;
+    for s in &mut sub[first + 1..last] {
+        *s += 1.0;
+    }
+    sub[last] += (b - last as f64) as f32;
 }
 
 struct VelloPen<'a> {
@@ -882,4 +1021,83 @@ pub(super) fn is_cjk(c: char) -> bool {
 pub(super) fn is_cjk_break_allowed(c: char) -> bool {
     // See: https://en.wikipedia.org/wiki/Line_breaking_rules_in_East_Asian_languages#Characters_not_permitted_on_the_start_of_a_line.
     !")]｝〕〉》」』】〙〗〟'\"｠»ヽヾーァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ々〻‐゠–〜?!‼⁇⁈⁉・、:;,。.".contains(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(path: &mut kurbo::BezPath, x0: f64, y0: f64, x1: f64, y1: f64) {
+        path.move_to((x0, y0));
+        path.line_to((x1, y0));
+        path.line_to((x1, y1));
+        path.line_to((x0, y1));
+        path.close_path();
+    }
+
+    #[test]
+    fn rows_are_sampled_once_along_their_middle() {
+        // A bar from y = 1.6 to 3.4 holds the middle of row 2 only. Antialiasing both ways
+        // would give rows 1 and 3 four tenths of its ink.
+        let mut path = kurbo::BezPath::new();
+        rect(&mut path, 1.0, 1.6, 7.0, 3.4);
+        let coverage = rasterize_rows(&path, (0.0, 0.0), 8, 5);
+        for row in [0, 1, 3, 4] {
+            assert!(
+                coverage[row * 8..(row + 1) * 8].iter().all(|&c| c == 0),
+                "row {row}"
+            );
+        }
+        // Across: ClearType's spread, 1/9 and 8/9 at each edge, and the ink of six pixels.
+        assert_eq!(
+            coverage[16..24],
+            [28, 227, 255, 255, 255, 255, 227, 28],
+            "row 2"
+        );
+    }
+
+    #[test]
+    fn overlapping_contours_count_once_and_holes_stay_empty() {
+        let mut path = kurbo::BezPath::new();
+        // Two overlapping bars wound the same way: their union.
+        rect(&mut path, 1.0, 0.0, 5.0, 1.0);
+        rect(&mut path, 3.0, 0.0, 7.0, 1.0);
+        // A box with a hole wound the other way.
+        rect(&mut path, 1.0, 2.0, 11.0, 3.0);
+        path.move_to((4.0, 2.0));
+        path.line_to((4.0, 3.0));
+        path.line_to((8.0, 3.0));
+        path.line_to((8.0, 2.0));
+        path.close_path();
+        let coverage = rasterize_rows(&path, (0.0, 0.0), 12, 3);
+        assert_eq!(coverage[..8], [28, 227, 255, 255, 255, 255, 227, 28]);
+        assert_eq!(coverage[24 + 5..24 + 7], [0, 0], "the hole");
+        assert_eq!(coverage[24 + 2], 255);
+    }
+
+    #[test]
+    fn glyphs_follow_the_rasterization_option() {
+        use crate::text::{FontDefinitions, FontFamily, FontId, Fonts};
+        let atlas = |glyph_rasterization| {
+            let options = TextOptions {
+                glyph_rasterization,
+                ..Default::default()
+            };
+            let mut fonts = Fonts::new(options, FontDefinitions::default());
+            fonts.with_pixels_per_point(1.5).layout_no_wrap(
+                "Hello".to_owned(),
+                FontId::new(14.0, FontFamily::Proportional),
+                Color32::WHITE,
+            );
+            fonts.image()
+        };
+        let symmetric = atlas(GlyphRasterization::Symmetric);
+        let horizontal = atlas(GlyphRasterization::HorizontalOnly);
+        assert_ne!(symmetric.pixels, horizontal.pixels);
+        // The same ink either way, give or take a few percent.
+        let ink =
+            |image: &crate::ColorImage| image.pixels.iter().map(|p| p.a() as f32).sum::<f32>();
+        let ratio = ink(&horizontal) / ink(&symmetric);
+        assert!((0.9..1.1).contains(&ratio), "{ratio}");
+    }
 }

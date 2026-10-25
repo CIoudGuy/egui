@@ -2438,12 +2438,28 @@ impl Visuals {
                 color_transfer_function,
                 font_hinting,
                 subpixel_binning,
+                glyph_rasterization,
             } = text_options;
 
             color_transfer_function_ui(ui, color_transfer_function);
 
             ui.checkbox(font_hinting, "Font hinting (sharper text)");
             ui.checkbox(subpixel_binning, "Sub-pixel binning (more even kerning)");
+            let mut horizontal_only =
+                *glyph_rasterization == epaint::text::GlyphRasterization::HorizontalOnly;
+            if ui
+                .checkbox(
+                    &mut horizontal_only,
+                    "Horizontal antialiasing only (crisp rows, as DirectWrite)",
+                )
+                .changed()
+            {
+                *glyph_rasterization = if horizontal_only {
+                    epaint::text::GlyphRasterization::HorizontalOnly
+                } else {
+                    epaint::text::GlyphRasterization::Symmetric
+                };
+            }
         });
 
         ui.collapsing("Text cursor", |ui| {
