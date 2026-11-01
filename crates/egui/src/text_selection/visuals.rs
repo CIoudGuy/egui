@@ -63,18 +63,27 @@ pub fn paint_text_selection(
             row.size.x + newline_size
         };
 
-        let rect = Rect::from_min_max(pos2(left, 0.0), pos2(right, row.size.y));
+        let first_glyph_index = if ri == min.row { min.column.0 } else { 0 };
+        let last_glyph_index = if ri == max.row {
+            max.column.0
+        } else {
+            row.glyphs.len()
+        };
+        let rects = if row.glyphs.iter().any(|glyph| glyph.rtl) {
+            // Glyphs that follow one another in the text need not be side by
+            // side on a row with right-to-left text.
+            let selected = row.glyphs.get(first_glyph_index..last_glyph_index);
+            visual_spans(selected.unwrap_or_default())
+                .into_iter()
+                .map(|(left, right)| Rect::from_min_max(pos2(left, 0.0), pos2(right, row.size.y)))
+                .collect()
+        } else {
+            vec![Rect::from_min_max(pos2(left, 0.0), pos2(right, row.size.y))]
+        };
         let mesh = &mut row.visuals.mesh;
 
         if !row.glyphs.is_empty() {
             // Change color of the selected text:
-            let first_glyph_index = if ri == min.row { min.column.0 } else { 0 };
-            let last_glyph_index = if ri == max.row {
-                max.column.0
-            } else {
-                row.glyphs.len()
-            };
-
             let first_vertex_index = row
                 .glyphs
                 .get(first_glyph_index)
@@ -94,42 +103,63 @@ pub fn paint_text_selection(
         // but behind (before) any glyphs. The row visuals has this information:
         let glyph_index_start = row.visuals.glyph_index_start;
 
-        // Start by appending the selection rectangle to end of the mesh, as two triangles (= 6 indices):
-        let num_indices_before = mesh.indices.len();
-        mesh.add_colored_rect(rect, background_color);
-        assert_eq!(
-            num_indices_before + 6,
-            mesh.indices.len(),
-            "We expect exactly 6 new indices"
-        );
+        for rect in rects {
+            // Start by appending the selection rectangle to end of the mesh, as two triangles (= 6 indices):
+            let num_indices_before = mesh.indices.len();
+            mesh.add_colored_rect(rect, background_color);
+            assert_eq!(
+                num_indices_before + 6,
+                mesh.indices.len(),
+                "We expect exactly 6 new indices"
+            );
 
-        // Copy out the new triangles:
-        let selection_triangles = [
-            mesh.indices[num_indices_before],
-            mesh.indices[num_indices_before + 1],
-            mesh.indices[num_indices_before + 2],
-            mesh.indices[num_indices_before + 3],
-            mesh.indices[num_indices_before + 4],
-            mesh.indices[num_indices_before + 5],
-        ];
+            // Copy out the new triangles:
+            let selection_triangles = [
+                mesh.indices[num_indices_before],
+                mesh.indices[num_indices_before + 1],
+                mesh.indices[num_indices_before + 2],
+                mesh.indices[num_indices_before + 3],
+                mesh.indices[num_indices_before + 4],
+                mesh.indices[num_indices_before + 5],
+            ];
 
-        // Move every old triangle forwards by 6 indices to make room for the new triangle:
-        for i in (glyph_index_start..num_indices_before).rev() {
-            mesh.indices.swap(i, i + 6);
+            // Move every old triangle forwards by 6 indices to make room for the new triangle:
+            for i in (glyph_index_start..num_indices_before).rev() {
+                mesh.indices.swap(i, i + 6);
+            }
+            // Put the new triangle in place:
+            mesh.indices[glyph_index_start..glyph_index_start + 6]
+                .clone_from_slice(&selection_triangles);
+
+            if let Some(new_vertex_indices) = &mut new_vertex_indices {
+                new_vertex_indices.push(RowVertexIndices {
+                    row: ri,
+                    vertex_indices: selection_triangles,
+                });
+            }
         }
-        // Put the new triangle in place:
-        mesh.indices[glyph_index_start..glyph_index_start + 6]
-            .clone_from_slice(&selection_triangles);
 
         row.visuals.mesh_bounds = mesh.calc_bounds();
-
-        if let Some(new_vertex_indices) = &mut new_vertex_indices {
-            new_vertex_indices.push(RowVertexIndices {
-                row: ri,
-                vertex_indices: selection_triangles,
-            });
-        }
     }
+}
+
+/// The stretches of the row that `glyphs` cover, left to right.
+fn visual_spans(glyphs: &[epaint::text::Glyph]) -> Vec<(f32, f32)> {
+    let mut spans: Vec<(f32, f32)> = glyphs
+        .iter()
+        .filter(|glyph| glyph.advance_width > 0.0)
+        .map(|glyph| (glyph.pos.x, glyph.max_x()))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Glyphs sit on whole pixels, so neighbours may be a fraction apart.
+    spans.dedup_by(|next, span| {
+        let joins = next.0 <= span.1 + 1.0;
+        if joins {
+            span.1 = span.1.max(next.1);
+        }
+        joins
+    });
+    spans
 }
 
 #[expect(clippy::too_many_arguments)]

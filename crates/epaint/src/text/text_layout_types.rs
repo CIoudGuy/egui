@@ -979,7 +979,7 @@ impl Row {
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
         // Left-to-right rows keep the original center test so existing cursor
         // positions do not move. Right-to-left rows are not monotonic in x, so
-        // the caret is the nearest leading edge instead.
+        // the caret is the nearest one instead.
         if self.glyphs.iter().all(|glyph| !glyph.rtl) {
             for (i, glyph) in self.glyphs.iter().enumerate() {
                 if desired_x < glyph.logical_rect().center().x {
@@ -991,9 +991,14 @@ impl Row {
 
         let mut best = 0usize;
         let mut best_dist = f32::INFINITY;
-        for index in 0..=self.glyphs.len() {
+        for index in (0..=self.glyphs.len()).filter(|&index| self.is_caret_stop(index)) {
             let dist = (desired_x - self.caret_x(index)).abs();
-            if dist < best_dist - 0.001 || ((dist - best_dist).abs() <= 0.001 && index > best) {
+            // Where the direction changes, the carets after the glyphs on
+            // either side share a place: take the side that was pointed at.
+            let pointed_at = self
+                .glyph_before_caret(index)
+                .is_some_and(|glyph| (glyph.pos.x..=glyph.max_x()).contains(&desired_x));
+            if dist < best_dist - 0.001 || ((dist - best_dist).abs() <= 0.001 && pointed_at) {
                 best_dist = dist;
                 best = index;
             }
@@ -1001,20 +1006,51 @@ impl Row {
         CharIndex(best)
     }
 
+    /// Whether a caret may stand before glyph `index`, or after the last
+    /// glyph: not inside a cluster, between a letter and its marks or between
+    /// the characters of one emoji.
+    fn is_caret_stop(&self, index: usize) -> bool {
+        let (Some(glyph), Some(before)) = (
+            self.glyphs.get(index),
+            index
+                .checked_sub(1)
+                .and_then(|before| self.glyphs.get(before)),
+        ) else {
+            return true;
+        };
+        let continues = glyph.advance_width == 0.0 && glyph.uv_rect.is_nothing();
+        glyph.cluster != before.cluster && !continues
+    }
+
+    /// The glyph the caret at `index` follows: the one before it that
+    /// advances, past marks and the stand-ins of a cluster's other characters.
+    fn glyph_before_caret(&self, index: usize) -> Option<&Glyph> {
+        self.glyphs[..index.min(self.glyphs.len())]
+            .iter()
+            .rev()
+            .find(|glyph| glyph.advance_width > 0.0)
+    }
+
     /// X of the caret before logical glyph `index`, or after the last glyph.
+    ///
+    /// The caret keeps to the glyph before it, at the edge that glyph ends on,
+    /// so it stays beside what was just typed whichever way that runs. Only
+    /// the caret that starts the row has to take the edge of the glyph after.
     fn caret_x(&self, index: usize) -> f32 {
-        if index >= self.glyphs.len() {
-            return if self.glyphs.last().is_some_and(|glyph| glyph.rtl) {
-                self.glyphs[self.glyphs.len() - 1].pos.x
+        if let Some(glyph) = self.glyph_before_caret(index) {
+            if glyph.rtl {
+                glyph.pos.x
             } else {
-                self.size.x
-            };
-        }
-        let glyph = &self.glyphs[index];
-        if glyph.rtl {
-            glyph.max_x()
+                glyph.max_x()
+            }
+        } else if let Some(glyph) = self.glyphs.iter().find(|glyph| glyph.advance_width > 0.0) {
+            if glyph.rtl {
+                glyph.max_x()
+            } else {
+                glyph.pos.x
+            }
         } else {
-            glyph.pos.x
+            self.size.x
         }
     }
 
@@ -1382,7 +1418,7 @@ impl Galley {
 /// ## Cursor positions
 impl Galley {
     pub fn cursor_left_one_character(&self, cursor: &CCursor) -> CCursor {
-        if self.row_has_rtl(cursor) {
+        if self.has_rtl() {
             return self.cursor_visually(cursor, true);
         }
         if cursor.index == CharIndex::ZERO {
@@ -1396,7 +1432,7 @@ impl Galley {
     }
 
     pub fn cursor_right_one_character(&self, cursor: &CCursor) -> CCursor {
-        if self.row_has_rtl(cursor) {
+        if self.has_rtl() {
             return self.cursor_visually(cursor, false);
         }
         CCursor {
@@ -1405,60 +1441,114 @@ impl Galley {
         }
     }
 
-    fn row_has_rtl(&self, cursor: &CCursor) -> bool {
-        let layout = self.layout_from_cursor(*cursor);
+    /// Whether any glyph was resolved right to left. Arrow keys then move the
+    /// caret the way they point on every row, left-to-right ones included,
+    /// because the rows of a right-to-left paragraph follow one another from
+    /// their left ends.
+    fn has_rtl(&self) -> bool {
         self.rows
-            .get(layout.row)
-            .is_some_and(|row| row.glyphs.iter().any(|glyph| glyph.rtl))
+            .iter()
+            .any(|row| row.glyphs.iter().any(|glyph| glyph.rtl))
     }
 
-    /// Move one character toward the visual left or right on a right-to-left row.
+    /// Whether the text at `cursor` is read right to left, so that Left is the
+    /// way on through it. Only once a caller has resolved glyphs right to left.
+    pub fn reads_right_to_left(&self, cursor: &CCursor) -> bool {
+        self.has_rtl() && self.paragraph_is_rtl(self.layout_from_cursor(*cursor).row)
+    }
+
+    /// Whether the paragraph that `row` is part of runs right to left. One
+    /// without a letter to say, such as an empty line, goes the way of the
+    /// whole text.
+    fn paragraph_is_rtl(&self, row: usize) -> bool {
+        let first_row = self.rows[..row]
+            .iter()
+            .rposition(|row| row.ends_with_newline)
+            .map_or(0, |newline| newline + 1);
+        let chars_before: usize = self.rows[..first_row]
+            .iter()
+            .map(|row| row.char_count_including_newline().0)
+            .sum();
+        let text = self.text();
+        let start = text
+            .char_indices()
+            .nth(chars_before)
+            .map_or(text.len(), |(byte, _)| byte);
+        let paragraph = text[start..].split('\n').next().unwrap_or_default();
+        match unicode_bidi::get_base_direction(paragraph) {
+            unicode_bidi::Direction::Ltr => false,
+            unicode_bidi::Direction::Rtl => true,
+            unicode_bidi::Direction::Mixed => {
+                unicode_bidi::get_base_direction_full(text) == unicode_bidi::Direction::Rtl
+            }
+        }
+    }
+
+    /// Move one character toward the visual left or right.
     fn cursor_visually(&self, cursor: &CCursor, left: bool) -> CCursor {
         let layout = self.layout_from_cursor(*cursor);
         let Some(row) = self.rows.get(layout.row) else {
             return *cursor;
         };
         let current_x = row.x_offset(layout.column);
+        // The nearest caret on that side. Where the direction changes two
+        // carets share a place, and the one nearer in the text is the next.
         let mut best: Option<(usize, f32)> = None;
-        for index in 0..=row.glyphs.len() {
-            if index == layout.column.0 {
-                continue;
-            }
+        for index in (0..=row.glyphs.len()).filter(|&index| row.is_caret_stop(index)) {
             let x = row.x_offset(CharIndex(index));
-            let delta = x - current_x;
-            let closer = if left {
-                delta < -0.01 && best.is_none_or(|(_, best_x)| x > best_x)
+            let beyond = if left {
+                x < current_x - 0.01
             } else {
-                delta > 0.01 && best.is_none_or(|(_, best_x)| x < best_x)
+                x > current_x + 0.01
             };
-            if closer {
+            let closer = best.is_none_or(|(best, best_x)| {
+                let nearer = (x - current_x).abs() - (best_x - current_x).abs();
+                nearer < -0.01
+                    || (nearer <= 0.01
+                        && index.abs_diff(layout.column.0) < best.abs_diff(layout.column.0))
+            });
+            if beyond && closer {
                 best = Some((index, x));
             }
         }
         if let Some((column, _)) = best {
-            return self.cursor_from_layout(LayoutCursor {
-                row: layout.row,
-                column: CharIndex(column),
-            });
+            return CCursor {
+                // The end of a wrapped row is the start of the next one.
+                prefer_next_row: true,
+                ..self.cursor_from_layout(LayoutCursor {
+                    row: layout.row,
+                    column: CharIndex(column),
+                })
+            };
         }
-        if left {
-            if layout.row == 0 {
-                return CCursor::default();
+
+        // Past the end of the row, onto the one before or after it in the
+        // text. A right-to-left paragraph goes on from the left end of a row.
+        let forward = left == self.paragraph_is_rtl(layout.row);
+        let entered = if forward {
+            if layout.row + 1 >= self.rows.len() {
+                return *cursor;
             }
-            let previous = layout.row - 1;
-            let column = self.rows[previous].glyphs.len();
-            self.cursor_from_layout(LayoutCursor {
-                row: previous,
-                column: CharIndex(column),
-            })
-        } else if layout.row + 1 < self.rows.len() {
-            self.cursor_from_layout(LayoutCursor {
+            LayoutCursor {
                 row: layout.row + 1,
                 column: CharIndex::ZERO,
-            })
+            }
         } else {
-            self.end()
+            let Some(previous) = layout.row.checked_sub(1) else {
+                return *cursor;
+            };
+            LayoutCursor {
+                row: previous,
+                column: self.rows[previous].char_count_excluding_newline(),
+            }
+        };
+        let entered = self.cursor_from_layout(entered);
+        if entered.index == cursor.index {
+            // The end of a wrapped row and the start of the next one are the
+            // same place in the text, so this has not moved yet.
+            return self.cursor_visually(&entered, left);
         }
+        entered
     }
 
     pub fn clamp_cursor(&self, cursor: &CCursor) -> CCursor {

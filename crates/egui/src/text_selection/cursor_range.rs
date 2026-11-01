@@ -273,23 +273,26 @@ fn move_single_cursor(
                 _ => return,
             }
         } else {
+            // In right-to-left text the next word, and the end of the row,
+            // are to the left.
+            let forward = (key == Key::ArrowLeft) == galley.reads_right_to_left(cursor);
             match key {
-                Key::ArrowLeft => {
+                Key::ArrowLeft | Key::ArrowRight => {
                     if modifiers.alt || modifiers.ctrl {
                         // alt on mac, ctrl on windows
-                        (ccursor_previous_word(galley, *cursor), None)
+                        if forward {
+                            (ccursor_next_word(galley, *cursor), None)
+                        } else {
+                            (ccursor_previous_word(galley, *cursor), None)
+                        }
                     } else if modifiers.mac_cmd {
-                        (galley.cursor_begin_of_row(cursor), None)
-                    } else {
+                        if forward {
+                            (galley.cursor_end_of_row(cursor), None)
+                        } else {
+                            (galley.cursor_begin_of_row(cursor), None)
+                        }
+                    } else if key == Key::ArrowLeft {
                         (galley.cursor_left_one_character(cursor), None)
-                    }
-                }
-                Key::ArrowRight => {
-                    if modifiers.alt || modifiers.ctrl {
-                        // alt on mac, ctrl on windows
-                        (ccursor_next_word(galley, *cursor), None)
-                    } else if modifiers.mac_cmd {
-                        (galley.cursor_end_of_row(cursor), None)
                     } else {
                         (galley.cursor_right_one_character(cursor), None)
                     }

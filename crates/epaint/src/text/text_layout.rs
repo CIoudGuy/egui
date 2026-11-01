@@ -81,6 +81,10 @@ struct Paragraph {
 
     /// In case of an empty paragraph ("\n"), use this as height.
     pub empty_paragraph_height: f32,
+
+    /// Byte ranges of [`LayoutJob::text`] shaped right to left. Their glyphs
+    /// stay in logical order until the rows are cut: see [`mirror_run`].
+    pub rtl_runs: Vec<Range<u32>>,
 }
 
 impl Paragraph {
@@ -90,6 +94,7 @@ impl Paragraph {
             section_index_at_start,
             glyphs: vec![],
             empty_paragraph_height: 0.0,
+            rtl_runs: vec![],
         }
     }
 }
@@ -144,13 +149,32 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
 
     let intrinsic_size = calculate_intrinsic_size(point_scale, &job, &paragraphs);
 
+    let rtl_runs: Vec<Range<u32>> = paragraphs
+        .iter()
+        .flat_map(|paragraph| paragraph.rtl_runs.iter().cloned())
+        .collect();
+
     let mut elided = false;
     let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
-    if elided && let Some(last_placed) = rows.last_mut() {
+    let overflow_glyphs = if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
         replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
         if let Some(last) = last_row.glyphs.last() {
             last_row.size.x = last.max_x();
+        }
+        usize::from(job.wrap.overflow_character.is_some())
+    } else {
+        0
+    };
+
+    if !rtl_runs.is_empty() {
+        let last_row = rows.len().saturating_sub(1);
+        for (i, placed_row) in rows.iter_mut().enumerate() {
+            let row = Arc::make_mut(&mut placed_row.row);
+            // The overflow character is not part of the run it replaced the end of.
+            let appended = if i == last_row { overflow_glyphs } else { 0 };
+            let shaped = row.glyphs.len().saturating_sub(appended);
+            restore_rtl_runs(&mut row.glyphs[..shaped], &rtl_runs, pixels_per_point);
         }
     }
 
@@ -494,6 +518,100 @@ fn emit_continuation_glyphs(
     }
 }
 
+/// Reverses the order of the shaped clusters in `glyphs` and mirrors their
+/// positions within the span they cover.
+///
+/// The shaper returns a right-to-left run in visual order: its last character
+/// first. Rows are cut and elided from the end of the glyph vector, which has
+/// to be the logical end, or a wrapped sentence would start on its last row.
+/// So a right-to-left run is mirrored as soon as it is shaped, and each piece
+/// of it is mirrored back by [`restore_rtl_runs`] once the rows are final.
+/// Mirroring twice changes nothing, so a run that stays on one row comes out
+/// as the shaper made it.
+fn mirror_run(glyphs: &mut [Glyph]) {
+    // A cluster is the glyphs sharing a cluster id, then the zero-width
+    // continuation glyphs of the characters it absorbed.
+    let is_continuation = |glyph: &Glyph| glyph.advance_width == 0.0 && glyph.uv_rect.is_nothing();
+    let mut clusters: Vec<Range<usize>> = vec![];
+    for (i, glyph) in glyphs.iter().enumerate() {
+        match clusters.last_mut() {
+            Some(cluster)
+                if glyph.cluster == glyphs[cluster.start].cluster || is_continuation(glyph) =>
+            {
+                cluster.end = i + 1;
+            }
+            _ => clusters.push(i..i + 1),
+        }
+    }
+    if clusters.len() < 2 {
+        return;
+    }
+
+    // Marks sit on their base with an offset of their own, so a span is that
+    // of the glyphs that advance, when there are any.
+    let span = |glyphs: &[Glyph]| {
+        let span_of = |advancing: bool| {
+            glyphs
+                .iter()
+                .filter(|glyph| !advancing || glyph.advance_width > 0.0)
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), glyph| {
+                    (min.min(glyph.pos.x), max.max(glyph.max_x()))
+                })
+        };
+        let span = span_of(true);
+        if span.0.is_finite() {
+            span
+        } else {
+            span_of(false)
+        }
+    };
+    let (min_x, max_x) = span(glyphs);
+
+    let mut mirrored = Vec::with_capacity(glyphs.len());
+    for cluster in clusters.into_iter().rev() {
+        let (cluster_min_x, cluster_max_x) = span(&glyphs[cluster.clone()]);
+        let delta = (min_x + max_x - cluster_max_x) - cluster_min_x;
+        mirrored.extend(glyphs[cluster].iter().map(|glyph| {
+            let mut glyph = *glyph;
+            glyph.pos.x += delta;
+            glyph
+        }));
+    }
+    glyphs.copy_from_slice(&mirrored);
+}
+
+/// Puts every piece of a right-to-left run back in the order the shaper gave
+/// it, now that the row's glyphs are final. See [`mirror_run`].
+fn restore_rtl_runs(glyphs: &mut [Glyph], rtl_runs: &[Range<u32>], pixels_per_point: f32) {
+    // Runs are in text order, as the sections of a job are.
+    let run_of = |glyph: &Glyph| {
+        let after = rtl_runs.partition_point(|run| run.start <= glyph.cluster);
+        after
+            .checked_sub(1)
+            .filter(|&run| glyph.cluster < rtl_runs[run].end)
+    };
+    let mut restored = false;
+    let mut start = 0;
+    while start < glyphs.len() {
+        let run = run_of(&glyphs[start]);
+        let mut end = start + 1;
+        while end < glyphs.len() && run_of(&glyphs[end]) == run {
+            end += 1;
+        }
+        if run.is_some() {
+            mirror_run(&mut glyphs[start..end]);
+            restored = true;
+        }
+        start = end;
+    }
+    if restored {
+        // A row that starts inside a run was moved by a fraction of a pixel.
+        for glyph in glyphs {
+            glyph.pos.x = (glyph.pos.x * pixels_per_point).round() / pixels_per_point;
+        }
+    }
+}
+
 // Ignores the Y coordinate.
 #[must_use]
 #[expect(clippy::too_many_arguments)]
@@ -586,7 +704,8 @@ fn layout_section(
             // left to right.
             // An emoji has no direction of its own; its parts join left to
             // right.
-            let direction = if run.rtl == Some(true) && !run.emoji {
+            let shaped_rtl = run.rtl == Some(true) && !run.emoji;
+            let direction = if shaped_rtl {
                 harfrust::Direction::RightToLeft
             } else {
                 harfrust::Direction::LeftToRight
@@ -616,6 +735,13 @@ fn layout_section(
                 paragraph,
                 segment_offset + run.byte_range.as_usize().start,
             );
+            if shaped_rtl && first_glyph < paragraph.glyphs.len() {
+                mirror_run(&mut paragraph.glyphs[first_glyph..]);
+                let start = (segment_offset + run.byte_range.as_usize().start) as u32;
+                paragraph
+                    .rtl_runs
+                    .push(start..start + run_text.len() as u32);
+            }
             if run.emoji {
                 let advance_px = *emoji_advance_px
                     .get_or_insert_with(|| emoji_advance(font, pixels_per_point, font_size));
@@ -1659,6 +1785,77 @@ mod tests {
         let bounds = [0usize, 6, 8];
         assert_eq!(cluster_char_range(&bounds, 0), 0..6);
         assert_eq!(cluster_char_range(&bounds, 6), 6..8);
+    }
+
+    /// A shaped glyph `width` wide at `x`, drawing the character at byte `cluster`.
+    fn shaped(cluster: u32, x: f32, width: f32) -> Glyph {
+        let ink = UvRect {
+            max: [1, 1],
+            ..Default::default()
+        };
+        Glyph {
+            chr: 'x',
+            pos: pos2(x, 0.0),
+            advance_width: width,
+            line_height: 10.0,
+            font_face_height: 10.0,
+            font_face_ascent: 8.0,
+            font_height: 10.0,
+            font_ascent: 8.0,
+            uv_rect: if width > 0.0 { ink } else { UvRect::default() },
+            section_index: 0,
+            first_vertex: 0,
+            cluster,
+            rtl: false,
+        }
+    }
+
+    #[test]
+    fn a_right_to_left_run_wraps_from_its_logical_start() {
+        // Three words as the shaper returns them, the last one first: the
+        // letter at byte 8 with the stand-in for the mark it absorbed, a
+        // space, two letters, a space, and the letter that starts the run.
+        let visual = [
+            shaped(8, 0.0, 6.0),
+            shaped(10, 6.0, 0.0),
+            shaped(7, 6.0, 3.0),
+            shaped(4, 9.0, 5.0),
+            shaped(2, 14.0, 7.0),
+            shaped(1, 21.0, 3.0),
+            shaped(0, 24.0, 4.0),
+        ];
+        let mut run = visual;
+        mirror_run(&mut run);
+        let order: Vec<u32> = run.iter().map(|glyph| glyph.cluster).collect();
+        assert_eq!(order, [0, 1, 2, 4, 7, 8, 10], "clusters in logical order");
+        let starts: Vec<f32> = run.iter().map(|glyph| glyph.pos.x).collect();
+        assert_eq!(starts, [0.0, 4.0, 7.0, 14.0, 19.0, 22.0, 28.0]);
+
+        // Whole, the run comes back as it was shaped.
+        let runs = std::slice::from_ref(&(0..12));
+        let mut whole = run;
+        restore_rtl_runs(&mut whole, runs, 1.0);
+        assert_eq!(whole, visual);
+
+        // Cut after the second word, the first row holds the first two words
+        // and the second row the last one, each as the shaper would lay it.
+        let (first, second) = run.split_at_mut(5);
+        restore_rtl_runs(first, runs, 1.0);
+        let row: Vec<(u32, f32)> = first
+            .iter()
+            .map(|glyph| (glyph.cluster, glyph.pos.x))
+            .collect();
+        assert_eq!(row, [(7, 0.0), (4, 3.0), (2, 8.0), (1, 15.0), (0, 18.0)]);
+        let start = second[0].pos.x;
+        for glyph in second.iter_mut() {
+            glyph.pos.x -= start;
+        }
+        restore_rtl_runs(second, runs, 1.0);
+        let row: Vec<(u32, f32)> = second
+            .iter()
+            .map(|glyph| (glyph.cluster, glyph.pos.x))
+            .collect();
+        assert_eq!(row, [(8, 0.0), (10, 6.0)]);
     }
 
     #[test]
