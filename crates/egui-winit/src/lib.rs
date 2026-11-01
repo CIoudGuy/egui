@@ -829,6 +829,17 @@ impl State {
                     .events
                     .push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
             }
+            winit::event::Ime::DeleteSurrounding {
+                before_chars,
+                after_chars,
+            } => {
+                self.egui_input
+                    .events
+                    .push(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
+                        before_chars: *before_chars,
+                        after_chars: *after_chars,
+                    }));
+            }
         }
     }
 
